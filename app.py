@@ -96,12 +96,25 @@ TIPOS_ACT = [
 ]
 
 # =====================================================================
-# CLIENTE GEMINI CON FALLBACK REAL Y CONTROL DE CUOTA
+# CLIENTE GEMINI CON AUTO-DETECCIÓN DE MODELOS ACTIVOS (GEMINI 3 / LATEST)
 # =====================================================================
-MODELOS_DISPONIBLES = [
+MODELOS_RESPALDO = [
+    "gemini-3-flash-preview",
+    "gemini-3.0-flash",
+    "gemini-3-flash",
+    "gemini-3.1-flash-preview",
+    "gemini-3.1-flash",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-flash-latest",
+    "gemini-3-pro-preview",
+    "gemini-3.0-pro",
+    "gemini-3-pro",
+    "gemini-3.1-pro-preview",
+    "gemini-pro-latest",
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
     "gemini-2.5-flash",
-    "gemini-2.5-pro",
-    "gemini-2.0-flash"
+    "gemini-2.5-pro"
 ]
 
 def obtener_cliente_gemini(api_key: str):
@@ -109,12 +122,64 @@ def obtener_cliente_gemini(api_key: str):
         return None
     return genai.Client(api_key=api_key.strip())
 
-def llamar_gemini(client, prompt_contents, modelo_preferido="gemini-2.5-flash", temperatura=0.1, max_reintentos=3):
-    """Llama a Gemini con cola de respaldo real y temperatura baja para máxima precisión jurídica."""
-    orden_modelos = [modelo_preferido] + [m for m in MODELOS_DISPONIBLES if m != modelo_preferido]
+def descubrir_modelos_activos(client):
+    """
+    Consulta directamente a Google qué modelos Gemini están habilitados
+    para la API Key del usuario en este momento, evitando errores 404.
+    """
+    modelos_cuenta = []
+    try:
+        for m in client.models.list():
+            nombre = getattr(m, "name", "")
+            if not nombre:
+                continue
+            limpio = nombre.replace("models/", "")
+            low = limpio.lower()
+            if "gemini" not in low:
+                continue
+            excluidos = [
+                "embedding", "imagen", "veo", "tts", "aqa",
+                "audio", "live", "robotics", "computer-use", "learnlm"
+            ]
+            if any(x in low for x in excluidos):
+                continue
+            acciones = getattr(m, "supported_actions", None) or getattr(m, "supported_generation_methods", None)
+            if acciones and not any("generatecontent" in str(a).lower() for a in acciones):
+                continue
+            modelos_cuenta.append(limpio)
+    except Exception:
+        pass
+
+    # Priorizar modelos Gemini 3 y Flash/Pro
+    def puntaje_modelo(mod_name):
+        n = mod_name.lower()
+        score = 0
+        if "gemini-3" in n:
+            score += 100
+        elif "latest" in n:
+            score += 80
+        elif "gemini-2.5" in n:
+            score += 50
+        if "flash" in n and "lite" not in n:
+            score += 20
+        elif "pro" in n:
+            score += 15
+        return -score
+
+    modelos_cuenta_ordenados = sorted(list(dict.fromkeys(modelos_cuenta)), key=puntaje_modelo)
+    # Unir los detectados en la cuenta con la lista de respaldo
+    cola_final = modelos_cuenta_ordenados + [m for m in MODELOS_RESPALDO if m not in modelos_cuenta_ordenados]
+    return cola_final
+
+def llamar_gemini(client, prompt_contents, modelo_preferido="Auto-Detectar (Recomendado)", temperatura=0.1, max_reintentos=2):
+    """Llama a Gemini detectando automáticamente el modelo activo en la API Key del usuario."""
+    cola_modelos = descubrir_modelos_activos(client)
+    if modelo_preferido and modelo_preferido != "Auto-Detectar (Recomendado)":
+        cola_modelos = [modelo_preferido] + [m for m in cola_modelos if m != modelo_preferido]
+
     errores = []
 
-    for modelo in orden_modelos:
+    for modelo in cola_modelos:
         for intento in range(max_reintentos):
             try:
                 resp = client.models.generate_content(
@@ -128,15 +193,20 @@ def llamar_gemini(client, prompt_contents, modelo_preferido="gemini-2.5-flash", 
                     return resp.text, modelo
             except Exception as e:
                 msg = str(e).lower()
-                errores.append(f"{modelo} (Intento {intento+1}): {str(e)[:120]}")
-                if "429" in msg or "quota" in msg or "resource_exhausted" in msg:
-                    time.sleep(5 * (intento + 1))
-                    continue
-                elif "404" in msg or "not found" in msg:
+                errores.append(f"{modelo}: {str(e)[:120]}")
+                # Si el modelo no existe o no está disponible para usuarios nuevos, saltar de inmediato al siguiente
+                if "404" in msg or "not found" in msg or "no longer available" in msg or "not supported" in msg:
                     break
-                else:
-                    time.sleep(2)
-    raise RuntimeError("No fue posible obtener respuesta de Gemini. Detalles: " + " | ".join(errores[-3:]))
+                # Si es límite de cuota por minuto (429), esperar un poco o probar otro modelo de la cola
+                if "429" in msg or "quota" in msg or "resource_exhausted" in msg:
+                    if intento == 0:
+                        time.sleep(4)
+                        continue
+                    else:
+                        break
+                time.sleep(2)
+
+    raise RuntimeError("No fue posible obtener respuesta. Últimos intentos: " + " | ".join(errores[-4:]))
 
 # =====================================================================
 # EXTRACCIÓN DOCUMENTAL AVANZADA + OCR HÍBRIDO (TESSERACT / GEMINI VISION)
@@ -144,13 +214,13 @@ def llamar_gemini(client, prompt_contents, modelo_preferido="gemini-2.5-flash", 
 def ocr_pagina_hibrido(page, client=None):
     """
     Intenta extraer texto de una página escaneada usando Tesseract local.
-    Si Tesseract no está disponible en el servidor, usa Gemini Vision como respaldo.
+    Si Tesseract no está disponible, usa Gemini Vision con auto-detección de modelo.
     """
     pix = page.get_pixmap(dpi=200)
     img_bytes = pix.tobytes("png")
     img = Image.open(io.BytesIO(img_bytes))
 
-    # 1. Intento con Tesseract local (si está instalado)
+    # 1. Intento con Tesseract local
     try:
         import pytesseract
         texto_ocr = pytesseract.image_to_string(img, lang="spa").strip()
@@ -159,19 +229,20 @@ def ocr_pagina_hibrido(page, client=None):
     except Exception:
         pass
 
-    # 2. Respaldo con Visión Nativa de Gemini (no requiere instalar binarios externos)
+    # 2. Respaldo con Visión Nativa de Gemini
     if client is not None:
         try:
-            resp = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[
+            texto_ia, _ = llamar_gemini(
+                client=client,
+                prompt_contents=[
                     img,
                     "Transcribe de manera exacta y literal todo el texto visible en esta página de documento jurídico/administrativo, incluyendo sellos, fechas, radicados y tablas. No agregues comentarios."
                 ],
-                config=types.GenerateContentConfig(temperature=0.0)
+                temperatura=0.0,
+                max_reintentos=1
             )
-            if resp and resp.text:
-                return resp.text.strip(), "OCR-GeminiVision"
+            if texto_ia:
+                return texto_ia.strip(), "OCR-GeminiVision"
         except Exception:
             pass
 
@@ -237,7 +308,6 @@ def procesar_archivo_subido(uploaded_file, client=None, usar_ocr_ia=True):
                 num_pag = i + 1
                 txt = page.get_text("text").strip()
 
-                # Si la página tiene menos de 35 caracteres, probablemente es escaneada
                 if len(txt) >= 35:
                     paginas_estructuradas.append({
                         "pagina": num_pag,
@@ -269,15 +339,13 @@ def procesar_archivo_subido(uploaded_file, client=None, usar_ocr_ia=True):
             for p in doc.paragraphs:
                 if p.text.strip():
                     parrafos.append(p.text.strip())
-            # Extraer también texto de tablas dentro del Word
-            for idx_t, table in enumerate(doc.tables):
+            for table in doc.tables:
                 for row in table.rows:
                     celdas = [c.text.strip().replace("\n", " ") for c in row.cells]
                     if any(celdas):
                         parrafos.append(" | ".join(celdas))
 
             texto_completo_docx = "\n".join(parrafos)
-            # Dividimos en bloques equivalentes a páginas (~3000 caracteres) para citación
             tam_pag = 3000
             for idx_b, inicio in enumerate(range(0, max(1, len(texto_completo_docx)), tam_pag)):
                 fragmento = texto_completo_docx[inicio:inicio + tam_pag]
@@ -375,7 +443,6 @@ def extraer_linea_tiempo_regex(items):
 # GENERADOR PROFESIONAL DE WORD (.DOCX) CON TABLAS Y NEGRILLAS REALES
 # =====================================================================
 def aplicar_color_celda(cell, hex_color):
-    """Aplica color de fondo (shading) a una celda de tabla en Word."""
     shading_elm = OxmlElement('w:shd')
     shading_elm.set(qn('w:val'), 'clear')
     shading_elm.set(qn('w:color'), 'auto')
@@ -383,7 +450,6 @@ def aplicar_color_celda(cell, hex_color):
     cell._tc.get_or_add_tcPr().append(shading_elm)
 
 def agregar_texto_con_negrillas(parrafo, texto):
-    """Convierte **texto** de Markdown en negrillas reales de Word sin dejar asteriscos."""
     partes = re.split(r'(\*\*.*?\*\*)', texto)
     for parte in partes:
         if parte.startswith('**') and parte.endswith('**') and len(parte) > 4:
@@ -393,7 +459,6 @@ def agregar_texto_con_negrillas(parrafo, texto):
             parrafo.add_run(parte)
 
 def volcar_tabla_en_word(doc, filas_tabla):
-    """Construye una tabla independiente y formateada en Word a partir de filas Markdown."""
     if not filas_tabla:
         return
     num_cols = max(len(f) for f in filas_tabla)
@@ -411,7 +476,6 @@ def volcar_tabla_en_word(doc, filas_tabla):
             p = celda.paragraphs[0]
             agregar_texto_con_negrillas(p, texto_celda)
 
-            # Estilo especial para la fila de encabezado
             if r_idx == 0:
                 aplicar_color_celda(celda, "1E3A8A")
                 for run in p.runs:
@@ -424,20 +488,17 @@ def volcar_tabla_en_word(doc, filas_tabla):
                 for run in p.runs:
                     run.font.size = Pt(9)
 
-    doc.add_paragraph()  # Espacio después de cada tabla
+    doc.add_paragraph()
 
 def convertir_markdown_a_docx_bytes(md_texto: str, titulo_portada="INFORME DE AUDITORÍA Y ANÁLISIS DE EXPEDIENTE"):
-    """Convierte el informe Markdown completo en un archivo Word (.docx) en memoria."""
     doc = Document()
 
-    # Configuración de márgenes estándar
     for section in doc.sections:
         section.top_margin = Inches(0.9)
         section.bottom_margin = Inches(0.9)
         section.left_margin = Inches(1.0)
         section.right_margin = Inches(1.0)
 
-    # Encabezado institucional del documento
     titulo = doc.add_heading(titulo_portada, level=0)
     titulo.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
@@ -454,12 +515,9 @@ def convertir_markdown_a_docx_bytes(md_texto: str, titulo_portada="INFORME DE AU
 
     for linea in lineas:
         linea_limpia = linea.strip()
-
-        # Detectar si es fila de tabla Markdown
         es_fila_tabla = linea_limpia.startswith('|') and linea_limpia.endswith('|') and len(linea_limpia) > 2
 
         if es_fila_tabla:
-            # Ignorar líneas separadoras de tabla como |---|---|
             contenido_sin_barras = linea_limpia.replace('|', '').replace('-', '').replace(':', '').strip()
             if not contenido_sin_barras:
                 continue
@@ -467,7 +525,6 @@ def convertir_markdown_a_docx_bytes(md_texto: str, titulo_portada="INFORME DE AU
             buffer_tabla.append(celdas)
             continue
         else:
-            # Si veníamos acumulando una tabla y terminó, la volcamos al Word y reiniciamos el buffer
             if buffer_tabla:
                 volcar_tabla_en_word(doc, buffer_tabla)
                 buffer_tabla = []
@@ -476,13 +533,13 @@ def convertir_markdown_a_docx_bytes(md_texto: str, titulo_portada="INFORME DE AU
             continue
 
         if linea_limpia.startswith('# '):
-            h = doc.add_heading(linea_limpia[2:].replace('**', ''), level=1)
+            doc.add_heading(linea_limpia[2:].replace('**', ''), level=1)
         elif linea_limpia.startswith('## '):
-            h = doc.add_heading(linea_limpia[3:].replace('**', ''), level=2)
+            doc.add_heading(linea_limpia[3:].replace('**', ''), level=2)
         elif linea_limpia.startswith('### '):
-            h = doc.add_heading(linea_limpia[4:].replace('**', ''), level=3)
+            doc.add_heading(linea_limpia[4:].replace('**', ''), level=3)
         elif linea_limpia.startswith('#### '):
-            h = doc.add_heading(linea_limpia[5:].replace('**', ''), level=4)
+            doc.add_heading(linea_limpia[5:].replace('**', ''), level=4)
         elif linea_limpia.startswith(('- ', '* ')):
             p = doc.add_paragraph(style='List Bullet')
             agregar_texto_con_negrillas(p, linea_limpia[2:])
@@ -500,7 +557,6 @@ def convertir_markdown_a_docx_bytes(md_texto: str, titulo_portada="INFORME DE AU
             p = doc.add_paragraph()
             agregar_texto_con_negrillas(p, linea_limpia)
 
-    # Si el documento terminó con una tabla pendiente
     if buffer_tabla:
         volcar_tabla_en_word(doc, buffer_tabla)
 
@@ -510,7 +566,7 @@ def convertir_markdown_a_docx_bytes(md_texto: str, titulo_portada="INFORME DE AU
     return buffer_word
 
 # =====================================================================
-# CONSTRUCCIÓN DEL PROMPT DE AUDITORÍA PROFUNDA (SIN RECORTE DE 2000 CHARS)
+# CONSTRUCCIÓN DEL PROMPT DE AUDITORÍA PROFUNDA
 # =====================================================================
 def construir_prompt_auditoria(
     items,
@@ -569,7 +625,7 @@ PROTOCOLO OBLIGATORIO DE VERIFICACIÓN Y ANTI-ALUCINACIÓN:
 1. **Inventario Real:** Analizas {total_docs} documentos que suman {total_pags} páginas ({total_ocr} procesadas mediante OCR).
 2. **Trazabilidad Estricta por Página:** Cada hallazgo, hecho o contradicción DEBE citar explícitamente `[Archivo | Página X]` usando las marcas `[[ARCHIVO: ... | PÁGINA X]]` del texto entregado y transcribir entre comillas el fragmento probatorio clave.
 3. **Cero Invenciones:** No inventes fechas, radicados, leyes ni nombres. Si un dato indispensable no aparece en el expediente, escribe en mayúsculas: `"NO CONSTA EN LOS DOCUMENTOS APORTADOS (VACÍO PROBATORIO)"`.
-4. **Cruce Inter-Documental Exhaustivo:** Compara lo que se afirma en demandas, quejas o contestaciones contra lo que dicen los oficios, resoluciones, contratos, folios, anexos o peritajes en otras páginas o archivos.
+4. **Cruce Inter-Documental Exhaustivo:** Compara lo que se afirma en demandas, quejas, incidentes o contestaciones contra lo que dicen los oficios, resoluciones, autos, historias clínicas, contratos o pruebas en otras páginas o archivos.
 
 INSUMO 1: CATÁLOGO GENERAL DE ARCHIVOS
 {catalogo_md}
@@ -582,15 +638,15 @@ INSUMO 3: CONTENIDO ÍNTEGRO PAGINADO DE LOS DOCUMENTOS DEL EXPEDIENTE
 
 ---
 
-GENERA UN INFORME JURÍDICO Y TÉCNICO EXHAUSTIVO EN FORMATO MARKDOWN CON LAS SIGUIENTES 12 SECCIONES OBLIGATORIAS:
+GENERA UN INFORME JURÍDICO Y TÉCNICO EXHAUSTIVO EN FORMATO MARKDOWN CON LAS SIGUIENTES 11 SECCIONES OBLIGATORIAS:
 
 # INFORME DE AUDITORÍA PROCESAL, CONTRADICCIONES Y PLAN DE ACCIÓN
 
 ## 1. FICHA TÉCNICA E IDENTIFICACIÓN DEL EXPEDIENTE
-(Tabla Markdown con: Radicado/Expediente, Entidad/Despacho, Demandante/Accionante/Quejoso, Demandado/Convocado, Tipo de Proceso, Estado Procesal Actual y Nivel de Riesgo/Viabilidad).
+(Tabla Markdown con: Radicado/Expediente, Entidad/Despacho, Demandante/Accionante/Incidentante, Demandado/Convocado/Accionado, Tipo de Proceso, Estado Procesal Actual y Nivel de Riesgo/Viabilidad).
 
 ## 2. RESUMEN EJECUTIVO DEL CASO
-(Síntesis clara del conflicto, qué se reclama, qué ha respondido la contraparte o la entidad y cuál es el cuello de botella actual del expediente).
+(Síntesis clara del conflicto, qué se reclama, qué ha respondido la contraparte o el juzgado/entidad y cuál es el cuello de botella actual del expediente).
 
 ## 3. LÍNEA DE TIEMPO CRONOLÓGICA CON TRAZABILIDAD
 (Tabla Markdown ordenada cronológicamente con columnas: `Fecha` | `Actuación / Documento` | `Archivo y Página` | `Resumen del Hecho o Decisión` | `Impacto Procesal`).
@@ -602,25 +658,25 @@ Además de la tabla, desarrolla en viñetas el análisis detallado de cada contr
 ## 5. AUDITORÍA DE PRUEBAS: HECHOS ACREDITADOS VS. AFIRMACIONES SIN SOPORTE
 (Separa en dos subsecciones o tabla comparativa:
 - **Hechos plenamente probados** indicando con qué documento y página se prueban.
-- **Alegaciones o promesas sin sustento probatorio** o documentos mencionados en los escritos pero que NO obran o están incompletos en los archivos subidos).
+- **Alegaciones o excusas sin sustento probatorio** o documentos mencionados en los escritos pero que NO obran o están incompletos en los archivos subidos).
 
-## 6. CONTROL DE ÓRDENES, REQUERIMIENTOS Y OBLIGACIONES INCUMPLIDAS
-(Identifica autos, oficios, compromisos publicitarios/contractuales o normas urbanísticas/administrativas citadas en el expediente: qué se ordenó u ofreció, quién debía cumplirlo, en qué plazo y si existe o no prueba de cumplimiento en los PDFs).
+## 6. CONTROL DE ÓRDENES JUDICIALES, REQUERIMIENTOS Y OBLIGACIONES INCUMPLIDAS
+(Identifica sentencias, autos, requerimientos o compromisos citados en el expediente: qué se ordenó, quién debía cumplirlo, en qué plazo y si existe o no prueba real de cumplimiento en los PDFs).
 
 ## 7. ANÁLISIS JURÍDICO Y NORMATIVO APLICABLE (COLOMBIA)
-(Fundamentos constitucionales, legales, procesales y jurisprudenciales aplicables al caso según su naturaleza: CGP, CPACA, Ley 1480 de 2011 - Estatuto del Consumidor, Ley 1755 de 2015, Código Disciplinario, etc., explicando cómo respaldan nuestra postura).
+(Fundamentos constitucionales, legales, procesales y jurisprudenciales aplicables al caso según su naturaleza: Acción de Tutela, Decreto 2591 de 1991, Incidente de Desacato, CGP, CPACA, Ley 1480 de 2011, Ley 1755 de 2015, etc., explicando cómo respaldan nuestra postura).
 
 ## 8. QUÉ SE DEBE HACER: HOJA DE RUTA Y PLAN DE ACCIÓN PASO A PASO
 (¡SECCIÓN CRÍTICA! Explica con total claridad y orden secuencial **qué se debe hacer ahora mismo**:
-1. **Acciones Inmediatas (0 a 5 días):** Memoriales, recursos, solicitudes de sanción/incidente o pruebas sobrevinientes que se deben radicar.
-2. **Pruebas adicionales que se deben conseguir o solicitar por oficio.**
-3. **Estrategia de bloqueo frente a los argumentos de la contraparte o entidad.**)
+1. **Acciones Inmediatas (0 a 5 días):** Memoriales, recursos, solicitudes de sanción/desacato, tutela o pruebas sobrevinientes que se deben radicar.
+2. **Pruebas adicionales que se deben anexar o solicitar por oficio.**
+3. **Estrategia de bloqueo frente a las excusas o argumentos de la contraparte/entidad.**)
 
 ## 9. TABLA DE PLAN DE ACCIÓN PRIORIZADO
 (Tabla Markdown con columnas: `Prioridad` | `Acción Concreta a Realizar` | `Ante Quién / Destinatario` | `Objetivo Jurídico` | `Documento o Prueba Base a Invocar`).
 
 ## 10. BORRADOR DE MEMORIAL / OFICIO / PRONUNCIAMIENTO LISTO PARA RADICAR
-(Redacta el borrador formal completo —con encabezado, referencia, radicado, hechos nuevos/contradicciones denunciadas, fundamentos de derecho y peticiones concretas— listo para copiar, ajustar datos finales y radicar en nombre de **{rol_usuario}**).
+(Redacta el borrador formal completo —con encabezado, referencia, radicado, hechos/contradicciones denunciadas, fundamentos de derecho y peticiones concretas— listo para copiar, ajustar datos finales y radicar en nombre de **{rol_usuario}**).
 
 ## 11. CHECKLIST DE VERIFICACIÓN ANTES DE RADICAR
 (Lista de chequeo práctica de anexos, firmas, términos y validaciones que el usuario debe revisar antes de enviar el documento).
@@ -651,9 +707,17 @@ with st.sidebar:
 
     modelo_sel = st.selectbox(
         "Modelo Gemini Principal",
-        options=["gemini-2.5-flash", "gemini-2.5-pro"],
+        options=[
+            "Auto-Detectar (Recomendado)",
+            "gemini-3-flash-preview",
+            "gemini-3.0-flash",
+            "gemini-3.1-flash-preview",
+            "gemini-flash-latest",
+            "gemini-3-pro-preview",
+            "gemini-3.0-pro"
+        ],
         index=0,
-        help="gemini-2.5-flash es rápido y lee hasta 1M de tokens. gemini-2.5-pro ofrece razonamiento jurídico aún más profundo."
+        help="Con 'Auto-Detectar', el programa consulta automáticamente qué modelos Gemini 3 están activos en tu API Key."
     )
 
     usar_ocr_vision = st.toggle(
@@ -668,6 +732,7 @@ with st.sidebar:
     tipo_proceso = st.selectbox(
         "Naturaleza del Expediente / Trámite",
         options=[
+            "Acción de Tutela / Incidente de Desacato / Derecho a la Salud",
             "Demanda Judicial (Civil / Contencioso Administrativo / Laboral)",
             "Demanda o Queja ante Superintendencia (SIC - Protección al Consumidor / Publicidad Engañosa)",
             "Actuación ante Procuraduría / Personería / Control Urbano y Espacio Público",
@@ -679,7 +744,7 @@ with st.sidebar:
     rol_usuario = st.selectbox(
         "Tu Rol en el Expediente",
         options=[
-            "Demandante / Accionante / Quejoso / Veedor Ciudadano",
+            "Demandante / Accionante / Agente Oficioso / Quejoso",
             "Demandado / Entidad Convocada / Defensa Técnica",
             "Auditor / Analista Jurídico Imparcial"
         ]
@@ -691,7 +756,7 @@ with st.sidebar:
         max_value=250000,
         value=120000,
         step=20000,
-        help="En tu Colab anterior estaba fijo en 2.000 caracteres (<1 página). Con 120.000 caracteres lee cerca de 50-60 páginas completas por cada archivo."
+        help="Con 120.000 caracteres lee cerca de 50-60 páginas completas por cada archivo sin saturar el límite por minuto de cuentas gratuitas."
     )
 
     st.divider()
@@ -745,7 +810,6 @@ with tab_carga:
             barra.progress(1.0, text="¡Extracción completada!")
             st.session_state.expediente_docs = docs_procesados
 
-            # Construir catálogo DataFrame
             filas_cat = []
             for it in docs_procesados:
                 filas_cat.append({
@@ -796,7 +860,7 @@ with tab_auditoria:
 
     enfoque_usuario = st.text_area(
         "🎯 ¿Qué puntos específicos, promesas incumplidas, fechas o contradicciones quieres que la IA revise con especial rigor? (Opcional)",
-        placeholder="Ejemplo: Verificar contradicciones entre lo ofrecido inicialmente en el proyecto/contrato y lo que responde la entidad o constructora en los oficios; verificar si cumplieron con las entregas o servicios prometidos y redactar el memorial de réplica o impulso procesal.",
+        placeholder="Ejemplo: Verificar contradicciones entre lo ordenado en el fallo de tutela y lo que responden las EPS o el juzgado en los autos del incidente de desacato; identificar incumplimientos y redactar el memorial correspondiente.",
         height=100
     )
 
@@ -819,7 +883,7 @@ with tab_auditoria:
                 limite_chars_por_doc=limite_chars
             )
 
-            with st.spinner("⚖️ Analizando todos los folios, cruzando pruebas y detectando contradicciones..."):
+            with st.spinner("⚖️ Detectando modelo Gemini activo, cruzando los 27 documentos y redactando el informe..."):
                 try:
                     texto_informe, modelo_usado = llamar_gemini(
                         client=client,
@@ -828,12 +892,11 @@ with tab_auditoria:
                         temperatura=0.1
                     )
                     st.session_state.informe_md = texto_informe
-                    st.success(f"✅ Auditoría completada con éxito utilizando `{modelo_usado}`. Puedes descargar el Word en la Pestaña 4 o aquí mismo.")
+                    st.success(f"✅ Auditoría completada con éxito utilizando el modelo `{modelo_usado}`. Ya puedes descargar el documento Word abajo.")
                 except Exception as e:
                     st.error(f"❌ Error al generar el informe: {str(e)}")
 
     if st.session_state.informe_md:
-        # Botón rápido de descarga en Word arriba del informe
         word_bytes_top = convertir_markdown_a_docx_bytes(st.session_state.informe_md)
         st.download_button(
             label="📥 Descargar Informe Completo en Word (.docx)",
@@ -856,7 +919,7 @@ with tab_rag:
         with st.chat_message(msj["role"]):
             st.markdown(msj["content"])
 
-    pregunta_chat = st.chat_input("Escribe tu pregunta sobre el expediente (ej. ¿En qué página se contradice la respuesta del demandado con el oficio anexo?)...")
+    pregunta_chat = st.chat_input("Escribe tu pregunta sobre el expediente (ej. ¿En qué página se contradice la respuesta del accionado con las pruebas?)...")
 
     if pregunta_chat:
         if not api_key_input:
