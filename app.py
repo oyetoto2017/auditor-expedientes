@@ -1,10 +1,10 @@
 import os
 import re
 import io
-import json
+import gc
 import time
 import hashlib
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from pathlib import Path
 
 import streamlit as st
@@ -22,10 +22,10 @@ from google import genai
 from google.genai import types
 
 # =====================================================================
-# CONFIGURACIÓN DE PÁGINA Y ESTILOS
+# CONFIGURACIÓN DE PÁGINA Y ESTILOS VISUALES EJECUTIVOS
 # =====================================================================
 st.set_page_config(
-    page_title="Auditor & Estratega Jurídico IA Colombia | Expedientes y Consultoría",
+    page_title="Bufete Litigante IA Colombia | Auditoría, Estrategia y Blindaje",
     page_icon="⚖️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -34,43 +34,94 @@ st.set_page_config(
 st.markdown("""
 <style>
     .main-header {
-        background: linear-gradient(90deg, #0f172a 0%, #1e3a8a 100%);
-        padding: 1.5rem;
-        border-radius: 10px;
+        background: linear-gradient(135deg, #0f172a 0%, #1e3a8a 65%, #1d4ed8 100%);
+        padding: 1.6rem 2rem;
+        border-radius: 12px;
         color: white;
-        margin-bottom: 1.5rem;
+        margin-bottom: 0.9rem;
+        border-bottom: 4px solid #f59e0b;
+        box-shadow: 0 4px 15px rgba(15, 23, 42, 0.15);
+    }
+    .status-bar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.65rem;
+        margin-bottom: 1.2rem;
+    }
+    .status-pill {
+        background-color: #f1f5f9;
+        border: 1px solid #cbd5e1;
+        color: #1e293b;
+        padding: 0.32rem 0.85rem;
+        border-radius: 999px;
+        font-size: 0.83rem;
+        font-weight: 600;
+    }
+    .status-pill-ok {
+        background-color: #ecfdf5;
+        border: 1px solid #6ee7b7;
+        color: #065f46;
+    }
+    .status-pill-warn {
+        background-color: #fffbeb;
+        border: 1px solid #fcd34d;
+        color: #92400e;
     }
     .tool-box {
-        background-color: #f8fafc;
+        background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%);
         border: 1px solid #cbd5e1;
         border-left: 5px solid #1e3a8a;
         padding: 1.2rem;
-        border-radius: 8px;
+        border-radius: 10px;
+        margin-bottom: 1.1rem;
+    }
+    .gold-box {
+        background-color: #fffbeb;
+        border: 1px solid #fde68a;
+        border-left: 5px solid #d97706;
+        padding: 1.1rem;
+        border-radius: 10px;
+        color: #78350f;
         margin-bottom: 1rem;
+    }
+    div[data-testid="stMetric"] {
+        background-color: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-top: 3px solid #1e3a8a;
+        padding: 0.75rem 1rem;
+        border-radius: 10px;
     }
 </style>
 """, unsafe_allow_html=True)
 
 # =====================================================================
-# ESTADO DE SESIÓN (MEMORIA VOLÁTIL SEGURA)
+# ESTADO DE SESIÓN Y BÓVEDA DE CACHÉ ANTI-BLOQUEO DE CPU
 # =====================================================================
-if "expediente_docs" not in st.session_state:
-    st.session_state.expediente_docs = []
-if "actuaciones_df" not in st.session_state:
-    st.session_state.actuaciones_df = pd.DataFrame()
-if "catalogo_df" not in st.session_state:
-    st.session_state.catalogo_df = pd.DataFrame()
-if "informe_md" not in st.session_state:
-    st.session_state.informe_md = ""
-if "estrategia_md" not in st.session_state:
-    st.session_state.estrategia_md = ""
-if "historial_chat" not in st.session_state:
-    st.session_state.historial_chat = []
+DEFAULTS_SESION = {
+    "expediente_docs": [],
+    "cache_archivos": {},
+    "actuaciones_df": pd.DataFrame(),
+    "catalogo_df": pd.DataFrame(),
+    "informe_md": "",
+    "estrategia_md": "",
+    "blindaje_md": "",
+    "historial_chat": []
+}
+for k_ses, v_def in DEFAULTS_SESION.items():
+    if k_ses not in st.session_state:
+        st.session_state[k_ses] = v_def
+
+def obtener_api_key_inicial():
+    try:
+        if "GOOGLE_API_KEY" in st.secrets:
+            return str(st.secrets["GOOGLE_API_KEY"]).strip()
+    except Exception:
+        pass
+    return os.environ.get("GOOGLE_API_KEY", "").strip()
 
 # =====================================================================
 # EXPRESIONES REGULARES CORREGIDAS PARA METADATOS Y FECHAS
 # =====================================================================
-# Prioriza años de 4 dígitos (ej. 2026) antes de años de 2 dígitos para no truncar 2026 en 20
 RE_FECHA = re.compile(r'\b\d{1,2}[\/\-]\d{1,2}[\/\-](?:\d{4}|\d{2})\b')
 RE_RADICADO = re.compile(
     r'(Radicado|Rad\.|Proceso|Expediente|Caso|No\.?)[ \t]*[:#\-]?[ \t]*([0-9]{4,23}(?:[-][0-9]{1,8})*)',
@@ -102,7 +153,82 @@ TIPOS_ACT = [
 ]
 
 # =====================================================================
-# CLIENTE GEMINI CON AUTO-DETECCIÓN DE MODELOS ACTIVOS
+# CALCULADORA OFICIAL DE TÉRMINOS Y FESTIVOS EN COLOMBIA (LEY EMILIANI)
+# =====================================================================
+def calcular_pascua(year: int) -> date:
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
+
+def trasladar_a_lunes(d: date) -> date:
+    if d.weekday() == 0:
+        return d
+    return d + timedelta(days=(7 - d.weekday()))
+
+@st.cache_data(show_spinner=False)
+def obtener_festivos_colombia(year: int) -> set:
+    fijos = [
+        date(year, 1, 1),
+        date(year, 5, 1),
+        date(year, 7, 20),
+        date(year, 8, 7),
+        date(year, 12, 8),
+        date(year, 12, 25),
+    ]
+    emiliani = [
+        trasladar_a_lunes(date(year, 1, 6)),
+        trasladar_a_lunes(date(year, 3, 19)),
+        trasladar_a_lunes(date(year, 6, 29)),
+        trasladar_a_lunes(date(year, 8, 15)),
+        trasladar_a_lunes(date(year, 10, 12)),
+        trasladar_a_lunes(date(year, 11, 1)),
+        trasladar_a_lunes(date(year, 11, 11)),
+    ]
+    dom_pascua = calcular_pascua(year)
+    religiosos = [
+        dom_pascua - timedelta(days=3),
+        dom_pascua - timedelta(days=2),
+        trasladar_a_lunes(dom_pascua + timedelta(days=39)),
+        trasladar_a_lunes(dom_pascua + timedelta(days=60)),
+        trasladar_a_lunes(dom_pascua + timedelta(days=68)),
+    ]
+    return set(fijos + emiliani + religiosos)
+
+def sumar_dias_habiles_colombia(fecha_inicio: date, dias_habiles: int):
+    actual = fecha_inicio
+    contados = 0
+    festivos_omitidos = []
+    fines_semana_omitidos = 0
+    ruta_dias = []
+
+    while contados < dias_habiles:
+        actual += timedelta(days=1)
+        festivos_anio = obtener_festivos_colombia(actual.year)
+        if actual.weekday() >= 5:
+            fines_semana_omitidos += 1
+            continue
+        if actual in festivos_anio:
+            festivos_omitidos.append(actual.strftime("%d/%m/%Y"))
+            continue
+        contados += 1
+        ruta_dias.append({"Día Hábil N°": contados, "Fecha": actual.strftime("%d/%m/%Y")})
+
+    return actual, fines_semana_omitidos, festivos_omitidos, pd.DataFrame(ruta_dias)
+
+# =====================================================================
+# CLIENTE GEMINI CON CACHÉ DE MODELOS (CERO CONSUMO REPETIDO DE RED/CPU)
 # =====================================================================
 MODELOS_RESPALDO = [
     "gemini-3-flash-preview",
@@ -126,10 +252,12 @@ def obtener_cliente_gemini(api_key: str):
         return None
     return genai.Client(api_key=api_key.strip())
 
-def descubrir_modelos_activos(client):
-    """Consulta a Google qué modelos Gemini están activos en la API Key actual."""
+@st.cache_data(ttl=3600, show_spinner=False)
+def descubrir_modelos_activos_cached(key_fingerprint: str, _api_key: str):
+    """Guarda en caché por 1 hora los modelos disponibles para no consultar en cada llamada."""
     modelos_cuenta = []
     try:
+        client = genai.Client(api_key=_api_key.strip())
         for m in client.models.list():
             nombre = getattr(m, "name", "")
             if not nombre:
@@ -166,13 +294,12 @@ def descubrir_modelos_activos(client):
             score += 15
         return -score
 
-    modelos_cuenta_ordenados = sorted(list(dict.fromkeys(modelos_cuenta)), key=puntaje_modelo)
-    cola_final = modelos_cuenta_ordenados + [m for m in MODELOS_RESPALDO if m not in modelos_cuenta_ordenados]
-    return cola_final
+    modelos_ordenados = sorted(list(dict.fromkeys(modelos_cuenta)), key=puntaje_modelo)
+    return modelos_ordenados + [m for m in MODELOS_RESPALDO if m not in modelos_ordenados]
 
-def llamar_gemini(client, prompt_contents, modelo_preferido="Auto-Detectar (Recomendado)", temperatura=0.1, max_reintentos=2):
-    """Ejecuta la consulta en Gemini seleccionando automáticamente el modelo habilitado."""
-    cola_modelos = descubrir_modelos_activos(client)
+def llamar_gemini(client, api_key: str, prompt_contents, modelo_preferido="Auto-Detectar (Recomendado)", temperatura=0.1, max_reintentos=2):
+    key_fp = hashlib.sha256(api_key.strip().encode("utf-8")).hexdigest()[:12]
+    cola_modelos = list(descubrir_modelos_activos_cached(key_fp, api_key))
     if modelo_preferido and modelo_preferido != "Auto-Detectar (Recomendado)":
         cola_modelos = [modelo_preferido] + [m for m in cola_modelos if m != modelo_preferido]
 
@@ -183,9 +310,7 @@ def llamar_gemini(client, prompt_contents, modelo_preferido="Auto-Detectar (Reco
                 resp = client.models.generate_content(
                     model=modelo,
                     contents=prompt_contents,
-                    config=types.GenerateContentConfig(
-                        temperature=temperatura,
-                    )
+                    config=types.GenerateContentConfig(temperature=temperatura)
                 )
                 if resp and resp.text:
                     return resp.text, modelo
@@ -196,43 +321,60 @@ def llamar_gemini(client, prompt_contents, modelo_preferido="Auto-Detectar (Reco
                     break
                 if "429" in msg or "quota" in msg or "resource_exhausted" in msg:
                     if intento == 0:
-                        time.sleep(4)
+                        time.sleep(3)
                         continue
-                    else:
-                        break
-                time.sleep(2)
+                    break
+                time.sleep(1.5)
 
     raise RuntimeError("No fue posible obtener respuesta. Últimos intentos: " + " | ".join(errores[-4:]))
 
 # =====================================================================
-# EXTRACCIÓN DOCUMENTAL + OCR HÍBRIDO (SIN BARRAS '|' EN LAS MARCAS)
+# MOTOR OCR ANTI-BLOQUEO DE CPU (CLOUD-FIRST + 130 DPI + LIBERACIÓN RAM)
 # =====================================================================
-def ocr_pagina_hibrido(page, client=None):
-    pix = page.get_pixmap(dpi=200)
-    img_bytes = pix.tobytes("png")
+def ocr_pagina_optimizado(page, api_key: str, client=None, modo_ocr="Nube Gemini Vision (0% CPU Local - Recomendado)"):
+    """
+    Evita que Streamlit limite la CPU por exceso de carga:
+    1. Si modo_ocr es 'Desactivado', omite imágenes pesadas.
+    2. Renderiza a 130 DPI (57.8% menos carga que 200 DPI manteniendo legibilidad total).
+    3. Prioriza Gemini Vision en la nube (0% uso de CPU de Streamlit) cuando hay API Key.
+    """
+    if modo_ocr.startswith("Desactivado"):
+        return "", "Omitido-AhorroCPU"
+
+    pix = page.get_pixmap(dpi=130, alpha=False)
+    img_bytes = pix.tobytes("jpeg")
+    del pix
     img = Image.open(io.BytesIO(img_bytes))
 
-    try:
-        import pytesseract
-        texto_ocr = pytesseract.image_to_string(img, lang="spa").strip()
-        if len(texto_ocr) > 25:
-            return texto_ocr, "OCR-Tesseract"
-    except Exception:
-        pass
-
-    if client is not None:
+    # Opción 1 (Recomendada): Nube de Google procesa el OCR -> 0% impacto en CPU de Streamlit
+    if modo_ocr.startswith("Nube") and client is not None and api_key:
         try:
             texto_ia, _ = llamar_gemini(
                 client=client,
+                api_key=api_key,
                 prompt_contents=[
                     img,
-                    "Transcribe de manera exacta y literal todo el texto visible en esta página de documento jurídico/administrativo, incluyendo sellos, fechas, radicados y tablas. No agregues comentarios."
+                    "Transcribe de forma exacta y literal todo el texto visible en esta página jurídica/administrativa, incluyendo sellos, fechas, radicados y tablas. No agregues comentarios."
                 ],
                 temperatura=0.0,
                 max_reintentos=1
             )
+            img.close()
             if texto_ia:
-                return texto_ia.strip(), "OCR-GeminiVision"
+                return texto_ia.strip(), "OCR-GeminiCloud"
+        except Exception:
+            pass
+
+    # Opción 2 / Respaldo: Tesseract local a baja resolución (130 DPI) para no saturar CPU
+    try:
+        import pytesseract
+        texto_ocr = pytesseract.image_to_string(img, lang="spa").strip()
+        img.close()
+        if len(texto_ocr) > 20:
+            return texto_ocr, "OCR-TesseractLigero"
+    except Exception:
+        try:
+            img.close()
         except Exception:
             pass
 
@@ -281,14 +423,18 @@ def extraer_metadatos_documento(texto: str):
 
     return meta
 
-def procesar_archivo_subido(uploaded_file, client=None, usar_ocr_ia=True):
+def procesar_archivo_subido(uploaded_file, api_key: str, client=None, modo_ocr="Nube Gemini Vision (0% CPU Local - Recomendado)"):
     """
-    Lee PDF, DOCX o TXT conservando trazabilidad exacta por página.
-    Usa el formato [Archivo: X - Pág. Y] sin barras verticales '|' para no romper tablas Markdown/Word.
+    Lee el archivo una sola vez y lo guarda en caché por su huella SHA-256.
+    Si el usuario sube archivos adicionales después, los anteriores consumen 0% de CPU.
     """
-    file_bytes = uploaded_file.read()
-    uploaded_file.seek(0)
+    file_bytes = uploaded_file.getvalue()
     hash_sha256 = hashlib.sha256(file_bytes).hexdigest()[:16]
+
+    clave_cache = f"{hash_sha256}_{modo_ocr[:8]}"
+    if clave_cache in st.session_state.cache_archivos:
+        return st.session_state.cache_archivos[clave_cache]
+
     nombre = uploaded_file.name
     ext = Path(nombre).suffix.lower()
 
@@ -299,8 +445,7 @@ def procesar_archivo_subido(uploaded_file, client=None, usar_ocr_ia=True):
     try:
         if ext == ".pdf":
             doc = fitz.open(stream=file_bytes, filetype="pdf")
-            total_pags = len(doc)
-            for i in range(total_pags):
+            for i in range(len(doc)):
                 page = doc[i]
                 num_pag = i + 1
                 txt = page.get_text("text").strip()
@@ -312,8 +457,7 @@ def procesar_archivo_subido(uploaded_file, client=None, usar_ocr_ia=True):
                         "texto": f"[Archivo: {nombre} - Pág. {num_pag}]\n{txt}"
                     })
                 else:
-                    cliente_ocr = client if usar_ocr_ia else None
-                    txt_ocr, metodo_ocr = ocr_pagina_hibrido(page, cliente_ocr)
+                    txt_ocr, metodo_ocr = ocr_pagina_optimizado(page, api_key=api_key, client=client, modo_ocr=modo_ocr)
                     if txt_ocr:
                         paginas_ocr.append(num_pag)
                         paginas_estructuradas.append({
@@ -325,17 +469,14 @@ def procesar_archivo_subido(uploaded_file, client=None, usar_ocr_ia=True):
                         paginas_vacias.append(num_pag)
                         paginas_estructuradas.append({
                             "pagina": num_pag,
-                            "origen": "Sin Texto",
-                            "texto": f"[Archivo: {nombre} - Pág. {num_pag} (SIN TEXTO LEGIBLE)]"
+                            "origen": metodo_ocr,
+                            "texto": f"[Archivo: {nombre} - Pág. {num_pag} (SIN TEXTO EXTRAÍDO)]"
                         })
             doc.close()
 
         elif ext == ".docx":
             doc = Document(io.BytesIO(file_bytes))
-            parrafos = []
-            for p in doc.paragraphs:
-                if p.text.strip():
-                    parrafos.append(p.text.strip())
+            parrafos = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
             for table in doc.tables:
                 for row in table.rows:
                     celdas = [c.text.strip().replace("\n", " ") for c in row.cells]
@@ -370,7 +511,7 @@ def procesar_archivo_subido(uploaded_file, client=None, usar_ocr_ia=True):
     texto_unificado = "\n\n".join([p["texto"] for p in paginas_estructuradas])
     meta = extraer_metadatos_documento(texto_unificado)
 
-    return {
+    resultado = {
         "nombre": nombre,
         "hash": hash_sha256,
         "num_paginas": len(paginas_estructuradas),
@@ -381,9 +522,10 @@ def procesar_archivo_subido(uploaded_file, client=None, usar_ocr_ia=True):
         "paginas": paginas_estructuradas,
         "raw": texto_unificado
     }
+    st.session_state.cache_archivos[clave_cache] = resultado
+    return resultado
 
 def extraer_linea_tiempo_regex(items):
-    """Detecta actuaciones y fechas completas (con 4 dígitos de año) sin capturar saltos de línea sucios."""
     patron_bloque = re.compile(
         r'(?m)^(?P<fecha>\d{1,2}[\/\-]\d{1,2}[\/\-](?:\d{4}|\d{2}))[ \t]*(?:[-–:][ \t]*)?(?P<encabezado>[\w\t \(\)\.,#º°\-]{8,110})$'
     )
@@ -441,7 +583,7 @@ def extraer_linea_tiempo_regex(items):
     return df_act[columnas_orden]
 
 # =====================================================================
-# GENERADOR PROFESIONAL DE WORD (.DOCX) Y EXCEL (.XLSX) BLINDADO
+# GENERADOR CACHEADO DE WORD (.DOCX) Y EXCEL (.XLSX) + EXTRACTOR DE MEMORIAL LIMPIO
 # =====================================================================
 def aplicar_color_celda(cell, hex_color):
     shading_elm = OxmlElement('w:shd')
@@ -461,10 +603,6 @@ def agregar_texto_con_negrillas(parrafo, texto):
             parrafo.add_run(parte)
 
 def dividir_fila_markdown_segura(linea_limpia: str):
-    """
-    Evita que una barra vertical '|' dentro de corchetes [[... | ...]] o [... | ...]
-    parta por error una celda en dos columnas dentro de las tablas de Word.
-    """
     linea_sanitizada = re.sub(
         r'\[+[^\]]*\]+',
         lambda m: m.group(0).replace('|', ' - '),
@@ -488,7 +626,6 @@ def volcar_tabla_en_word(doc, filas_tabla):
     tabla.style = 'Table Grid'
 
     for r_idx, fila in enumerate(filas_tabla):
-        # Si una fila tiene más elementos que el encabezado, unir el excedente en la última celda
         if len(fila) > num_cols:
             fila_ajustada = fila[:num_cols - 1] + [" - ".join(fila[num_cols - 1:])]
         else:
@@ -515,25 +652,44 @@ def volcar_tabla_en_word(doc, filas_tabla):
 
     doc.add_paragraph()
 
-def convertir_markdown_a_docx_bytes(md_texto: str, titulo_portada="INFORME JURÍDICO Y PLAN DE ACCIÓN PROCESAL"):
+def extraer_solo_borrador_radicable(md_texto: str) -> str:
+    """
+    Extrae únicamente el texto del Memorial / Demanda / Petición / Queja (Sección 10 o Sección 7)
+    para que el usuario pueda descargar un Word 100% limpio listo para firmar y radicar.
+    """
+    patron_inicio = re.compile(r'(?im)^##\s*(?:10|7)\.\s*BORRADOR.*$')
+    m_ini = patron_inicio.search(md_texto)
+    if not m_ini:
+        return ""
+    resto = md_texto[m_ini.end():].strip()
+    patron_fin = re.compile(r'(?im)^##\s*(?:11|8)\.\s*CHECKLIST.*$')
+    m_fin = patron_fin.search(resto)
+    if m_fin:
+        resto = resto[:m_fin.start()].strip()
+    return resto
+
+@st.cache_data(max_entries=12, show_spinner=False)
+def convertir_markdown_a_docx_bytes(md_texto: str, titulo_portada="INFORME JURÍDICO Y PLAN DE ACCIÓN PROCESAL", incluir_portada=True) -> bytes:
+    """Cacheado en memoria para no volver a consumir CPU en cada clic de Streamlit."""
     doc = Document()
 
     for section in doc.sections:
         section.top_margin = Inches(0.85)
         section.bottom_margin = Inches(0.85)
-        section.left_margin = Inches(0.95)
-        section.right_margin = Inches(0.95)
+        section.left_margin = Inches(1.0)
+        section.right_margin = Inches(1.0)
 
-    titulo = doc.add_heading(titulo_portada, level=0)
-    titulo.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    if incluir_portada:
+        titulo = doc.add_heading(titulo_portada, level=0)
+        titulo.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    sub = doc.add_paragraph()
-    sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run_sub = sub.add_run(f"Generado el {datetime.now().strftime('%d/%m/%Y a las %H:%M')} | Auditoría Jurídica y Estratégica Bajo Normativa Colombiana")
-    run_sub.italic = True
-    run_sub.font.size = Pt(9.5)
-    run_sub.font.color.rgb = RGBColor(100, 116, 139)
-    doc.add_paragraph("_" * 72)
+        sub = doc.add_paragraph()
+        sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run_sub = sub.add_run(f"Generado el {datetime.now().strftime('%d/%m/%Y a las %H:%M')} | Bufete Litigante IA Colombia")
+        run_sub.italic = True
+        run_sub.font.size = Pt(9.5)
+        run_sub.font.color.rgb = RGBColor(100, 116, 139)
+        doc.add_paragraph("_" * 70)
 
     lineas = md_texto.split('\n')
     buffer_tabla = []
@@ -587,11 +743,10 @@ def convertir_markdown_a_docx_bytes(md_texto: str, titulo_portada="INFORME JURÍ
 
     buffer_word = io.BytesIO()
     doc.save(buffer_word)
-    buffer_word.seek(0)
-    return buffer_word
+    return buffer_word.getvalue()
 
-def generar_excel_formateado_bytes(catalogo_df: pd.DataFrame, actuaciones_df: pd.DataFrame):
-    """Crea un archivo Excel estilizado con encabezados institucionales y columnas ajustadas."""
+@st.cache_data(max_entries=6, show_spinner=False)
+def generar_excel_formateado_bytes(catalogo_df: pd.DataFrame, actuaciones_df: pd.DataFrame) -> bytes:
     buffer_excel = io.BytesIO()
     with pd.ExcelWriter(buffer_excel, engine="openpyxl") as writer:
         catalogo_df.to_excel(writer, sheet_name="01_Catalogo_Documentos", index=False)
@@ -616,22 +771,32 @@ def generar_excel_formateado_bytes(catalogo_df: pd.DataFrame, actuaciones_df: pd
                 for cell in col[1:]:
                     cell.alignment = Alignment(vertical="top", wrap_text=True)
 
-    buffer_excel.seek(0)
-    return buffer_excel
+    return buffer_excel.getvalue()
 
 # =====================================================================
-# PROMPTS JURÍDICOS MULTIJURISDICCIONALES (EXPEDIENTES Y CONSULTORÍA)
+# PROMPTS JURÍDICOS MULTIJURISDICCIONALES COLOMBIA
 # =====================================================================
 MARCO_JURIDICO_COLOMBIA = """
 DOMINIO NORMATIVO Y PROCESAL COLOMBIANO OBLIGATORIO SEGÚN LA ENTIDAD:
-- Constitucional y Salud: Constitución Política (Arts. 11, 23, 29, 49, 86), Decreto 2591 de 1991 (Tutela y Desacato), Ley Estatutaria 1751 de 2015, Sentencias SU-034 de 2018 y T-760 de 2008.
-- Derecho de Petición y Procedimiento Administrativo: Ley 1755 de 2015 y CPACA (Ley 1437 de 2011 modificada por Ley 2080 de 2021).
-- Protección al Consumidor, Constructoras e Inmobiliarias (SIC): Ley 1480 de 2011 (Estatuto del Consumidor: publicidad engañosa, efectividad de la garantía, información mínima, cláusulas abusivas), Circular Única de la SIC.
-- Control Disciplinario, Urbano y Ministerio Público (Procuraduría, Personerías, Alcaldías): Ley 1952 de 2019 y Ley 2094 de 2021 (Código General Disciplinario), Ley 388 de 1997 (Ordenamiento Territorial, entregas de zonas de cesión y espacio público), Ley 1801 de 2016 (Código Nacional de Seguridad y Convivencia Ciudadana - Querellas Policivas), Ley 142 de 1994 (Servicios Públicos Domiciliarios).
-- Procesal Civil, Comercial y Propiedad Horizontal: Ley 1564 de 2012 (Código General del Proceso - CGP), Código Civil, Código de Comercio, Ley 675 de 2001.
+- Constitucional y Salud: Constitución Política (Arts. 11, 23, 29, 49, 86), Decreto 2591 de 1991 (Tutela, Medida Provisional Art. 7, Impugnación Art. 31, Cumplimiento Art. 27 y Desacato Art. 52), Ley Estatutaria 1751 de 2015, Sentencias SU-034 de 2018 y T-760 de 2008.
+- Derecho de Petición y Procedimiento Administrativo: Ley 1755 de 2015 (15 días hábiles petición general, 10 días documentos/información, 30 días consultas; reserva legal e insistencia) y CPACA (Ley 1437 de 2011 modificada por Ley 2080 de 2021).
+- Protección al Consumidor, Constructoras e Inmobiliarias (SIC): Ley 1480 de 2011 (Estatuto del Consumidor: publicidad engañosa Arts. 29 y 30, efectividad de la garantía inmobiliaria y de bienes Arts. 7 a 16, información mínima Art. 23, cláusulas abusivas Arts. 42 y 43, acción jurisdiccional Art. 58), Circular Única de la SIC.
+- Control Disciplinario, Urbano y Ministerio Público (Procuraduría, Personerías, Alcaldías): Ley 1952 de 2019 y Ley 2094 de 2021 (Código General Disciplinario), Ley 388 de 1997 y Decreto 1077 de 2015 (Ordenamiento Territorial, licencias urbanísticas, entregas de zonas de cesión y espacio público), Ley 1801 de 2016 (Código Nacional de Seguridad y Convivencia Ciudadana - Querellas Policivas), Ley 142 de 1994 (Servicios Públicos Domiciliarios y silencio administrativo positivo).
+- Procesal Civil, Comercial y Propiedad Horizontal: Ley 1564 de 2012 (Código General del Proceso - CGP), Ley 2213 de 2022 (Justicia Digital y traslado previo de escritos), Código Civil, Código de Comercio, Ley 675 de 2001.
 - Laboral y Función Pública / Concursos de Méritos: CST, CPTSS, Ley 909 de 2004, Decretos reglamentarios CNSC.
-- Penal y Disciplinario Judicial: Ley 599 de 2000 (Código Penal: fraude en resolución judicial, prevaricato por acción u omisión, estafa, urbanización ilegal), Ley 906 de 2004, Comisión Nacional de Disciplina Judicial.
+- Penal y Disciplinario Judicial: Ley 599 de 2000 (Código Penal: fraude a resolución judicial Art. 454, fraude procesal Art. 453, prevaricato por acción u omisión Arts. 413-414, estafa Art. 246, urbanización ilegal Art. 318), Ley 906 de 2004, Comisión Nacional de Disciplina Judicial.
 """
+
+def formatear_datos_firmante(datos_firmante: dict) -> str:
+    if not any(datos_firmante.values()):
+        return "El usuario no ingresó datos personales fijos; deja espacios claros entre corchetes solo donde falte cédula, correo o teléfono."
+    return (
+        f"- Nombre del Firmante: {datos_firmante.get('nombre') or '[Por completar]'}\n"
+        f"- Identificación / C.C. / T.P.: {datos_firmante.get('documento') or '[Por completar]'}\n"
+        f"- Municipio / Ciudad: {datos_firmante.get('ciudad') or '[Por completar]'}\n"
+        f"- Correo de Notificación Judicial: {datos_firmante.get('correo') or '[Por completar]'}\n"
+        f"- Teléfono / Celular: {datos_firmante.get('telefono') or '[Por completar]'}"
+    )
 
 def construir_prompt_auditoria(
     items,
@@ -641,6 +806,7 @@ def construir_prompt_auditoria(
     entidad_especifica,
     rol_usuario,
     enfoque_especial,
+    datos_firmante,
     limite_chars_por_doc=120000
 ):
     total_docs = len(items)
@@ -658,10 +824,10 @@ def construir_prompt_auditoria(
             mitad = limite_chars_por_doc // 2
             texto_doc = (
                 texto_doc[:mitad]
-                + f"\n\n[... SECCIÓN INTERMEDIA OMITIDA POR LONGITUD EXTREMA ({len(it['raw'])} chars totales) ...]\n\n"
+                + f"\n\n[... SECCIÓN INTERMEDIA OMITIDA POR EXTENSIÓN ({len(it['raw'])} chars totales) ...]\n\n"
                 + texto_doc[-mitad:]
             )
-            nota_recorte = f" (Documento extenso optimizado a {limite_chars_por_doc} caracteres)"
+            nota_recorte = f" (Optimizado a {limite_chars_por_doc} caracteres)"
 
         bloque = f"""
 =====================================================================
@@ -680,7 +846,7 @@ DOCUMENTO #{idx}: {it['nombre']}{nota_recorte}
     expediente_completo_str = "\n\n".join(bloques_documentales)
 
     prompt = f"""
-Actúa como un **Abogado Litigante Senior, Auditor Forense de Expedientes y Estratega Procesal Colombiano** experto en litigio ante cualquier entidad judicial, administrativa, superintendencia u órgano de control en Colombia.
+Actúa como un **Abogado Litigante Senior, Auditor Forense de Expedientes y Estratega Procesal Colombiano** experto ante cualquier despacho judicial, superintendencia, alcaldía u órgano de control en Colombia.
 
 {MARCO_JURIDICO_COLOMBIA}
 
@@ -688,11 +854,14 @@ CONTEXTO ESTRATÉGICO DEL CASO:
 - **Jurisdicción / Tipo de Trámite:** {tipo_proceso}
 - **Entidad / Despacho / Autoridad Específica:** {entidad_especifica or 'Determinar según los documentos del expediente'}
 - **Posición / Rol que representamos:** {rol_usuario}
-- **Enfoque Especial o Problema Planteado por el Usuario:** {enfoque_especial or 'Auditar todo el expediente, detectar contradicciones entre los PDFs, identificar incumplimientos o errores de la entidad/contraparte y definir exactamente qué hacer y qué radicar a continuación.'}
+- **Enfoque Especial Solicitado:** {enfoque_especial or 'Auditar todo el expediente, detectar contradicciones entre los PDFs, identificar errores o incumplimientos y definir qué hacer y qué radicar a continuación.'}
+
+DATOS DEL SUSCRIPTOR PARA EL BORRADOR DE LA SECCIÓN 10:
+{formatear_datos_firmante(datos_firmante)}
 
 REGLAS TÉCNICAS Y DE FORMATO OBLIGATORIAS:
 1. **Inventario Real:** Analizas {total_docs} documentos que suman {total_pags} páginas ({total_ocr} procesadas mediante OCR).
-2. **Formato de Citación (PROHIBIDO USAR BARRAS VERTICALES `|` DENTRO DE CITAS):** Cada hallazgo, hecho o contradicción DEBE citar el archivo y la página usando ÚNICAMENTE el formato `(Archivo: nombre.pdf, Pág. X)`. NUNCA uses el símbolo `|` dentro de los corchetes o paréntesis para no desajustar las tablas de Word.
+2. **Formato de Citación (PROHIBIDO USAR BARRAS VERTICALES `|` DENTRO DE CITAS):** Cita siempre usando ÚNICAMENTE `(Archivo: nombre.pdf, Pág. X)`. NUNCA uses el símbolo `|` dentro de paréntesis o corchetes para no alterar las tablas de Word.
 3. **Cero Invenciones:** No inventes fechas, radicados ni pruebas. Si falta un soporte clave, escribe: `"NO CONSTA EN LOS DOCUMENTOS APORTADOS (VACÍO PROBATORIO)"`.
 
 INSUMO 1: CATÁLOGO GENERAL DE ARCHIVOS
@@ -706,7 +875,7 @@ INSUMO 3: CONTENIDO ÍNTEGRO PAGINADO DE LOS DOCUMENTOS DEL EXPEDIENTE
 
 ---
 
-GENERA EL DICTAMEN JURÍDICO COMPLETO EN FORMATO MARKDOWN CON ESTAS 12 SECCIONES OBLIGATORIAS:
+GENERA EL DICTAMEN JURÍDICO COMPLETO EN FORMATO MARKDOWN CON ESTAS 11 SECCIONES EXACTAS:
 
 # INFORME DE AUDITORÍA PROCESAL, CONTRADICCIONES Y PLAN DE ACCIÓN
 
@@ -714,38 +883,35 @@ GENERA EL DICTAMEN JURÍDICO COMPLETO EN FORMATO MARKDOWN CON ESTAS 12 SECCIONES
 (Tabla Markdown de 2 columnas `Campo` | `Detalle` con: Radicado/Expediente, Entidad o Despacho, Demandante/Accionante/Quejoso, Demandado/Convocado/Investigado, Naturaleza del Proceso, Etapa Actual y Nivel de Riesgo/Viabilidad).
 
 ## 2. RESUMEN EJECUTIVO Y DIAGNÓSTICO PROCESAL
-(Síntesis precisa del litigio o trámite, qué se reclama, qué ha hecho o respondido la contraparte/entidad y cuál es el nudo crítico actual).
+(Síntesis precisa del litigio o trámite, qué se reclama, qué ha respondido la contraparte/entidad y cuál es el nudo crítico actual).
 
 ## 3. LÍNEA DE TIEMPO CRONOLÓGICA CON TRAZABILIDAD
-(Tabla Markdown con 5 columnas: `Fecha` | `Actuación o Documento` | `Archivo y Página (sin usar símbolo |)` | `Hecho o Decisión Clave` | `Impacto Procesal`).
+(Tabla Markdown con 5 columnas: `Fecha` | `Actuación o Documento` | `Archivo y Página` | `Hecho o Decisión Clave` | `Impacto Procesal`).
 
 ## 4. MATRIZ EXHAUSTIVA DE CONTRADICCIONES E INCONSISTENCIAS DETECTADAS
 (Tabla Markdown con 6 columnas: `N°` | `Punto en Conflicto` | `Versión o Afirmación A (Cita + Archivo y Pág.)` | `Prueba o Versión B que la contradice (Cita + Archivo y Pág.)` | `Tipo de Contradicción` | `Gravedad y Cómo Explotarla Procesalmente`).
-Después de la tabla, explica a fondo cada contradicción y qué implicación legal tiene (falsa motivación, defecto fáctico, publicidad engañosa, fraude procesal, confesión, etc.).
+Después de la tabla, desarrolla a fondo cada contradicción y su consecuencia jurídica (confesión, defecto fáctico, falsa motivación, publicidad engañosa, fraude procesal, etc.).
 
 ## 5. AUDITORÍA DE PRUEBAS: HECHOS PROBADOS VS. VACÍOS PROBATORIOS
-(Separa claramente qué hechos ya están 100% acreditados con su página exacta y qué afirmaciones de la contraparte o nuestras carecen de prueba idónea en el expediente).
+(Separa hechos plenamente probados con su página exacta frente a afirmaciones sin soporte probatorio).
 
 ## 6. CONTROL DE ÓRDENES, OBLIGACIONES Y PLAZOS INCUMPLIDOS
 (Tabla Markdown con 5 columnas: `Orden / Compromiso / Norma` | `Obligado o Responsable` | `Plazo Legal o Fijado` | `Estado Actual` | `Evidencia en el Expediente`).
 
 ## 7. FUNDAMENTACIÓN JURÍDICA, LEYES Y JURISPRUDENCIA APLICABLE EN COLOMBIA
-(Cita con precisión las normas colombianas exactas —artículos de leyes, códigos, decretos y sentencias de la Corte Constitucional, Corte Suprema, Consejo de Estado o Superintendencias— que gobiernan este caso y respaldan nuestra posición).
+(Cita artículos exactos de leyes, códigos, decretos y sentencias aplicables en Colombia).
 
-## 8. QUÉ SE DEBE HACER AHORA MISMO: RUTA PROCESAL PASO A PASO (ACTUACIONES REALIZADAS Y PENDIENTES)
-(Explica como abogado litigante experto:
-1. **Actuación Principal Inmediata (0 a 3 días):** Qué escrito, recurso, incidente, demanda o queja se debe radicar y por qué.
-2. **Actuaciones Complementarias o Ante Otras Entidades (Plan B / Presión Institucional):** Si cabe queja disciplinaria (Procuraduría/Personería/Comisión de Disciplina Judicial), vigilancia judicial/administrativa, queja ante Superintendencia (SIC/Supersalud/Superservicios), acción popular, tutela o denuncia penal.
-3. **Términos Legales y Precauciones:** Plazos de vencimiento, caducidad o requisitos de procedibilidad que debemos cuidar).
+## 8. QUÉ SE DEBE HACER AHORA MISMO: RUTA PROCESAL PASO A PASO
+(1. Actuación Principal Inmediata de 0 a 3 días; 2. Actuaciones Complementarias o de Presión Institucional ante Superintendencias, Procuraduría, Personería, Fiscalía o Comisión de Disciplina; 3. Términos legales y precauciones procesales como envío simultáneo Ley 2213 de 2022).
 
 ## 9. TABLA DE PLAN DE ACCIÓN PRIORIZADO
 (Tabla Markdown con 5 columnas: `Prioridad` | `Acción Jurídica Concreta` | `Entidad / Destinatario` | `Objetivo Procesal` | `Sustento Normativo y Probatorio`).
 
 ## 10. BORRADOR COMPLETO DE MEMORIAL / DEMANDA / QUEJA / OFICIO LISTO PARA RADICAR
-(Redacta el documento jurídico formal completo y extenso, con estructura procesal colombiana: Encabezado de la entidad/juez, Referencia/Radicado, Identificación de quien suscribe, Hechos numerados con citas del expediente, Contradicciones o Incumplimientos denunciados, Fundamentos de Derecho, Pruebas/Anexos, Notificaciones y Peticiones principales y subsidiarias).
+(IMPORTANTE: Redacta aquí ÚNICAMENTE el texto formal, limpio, extenso y completo del documento listo para radicar ante la autoridad, sin comentarios internos de auditoría, incluyendo Encabezado, Referencia, Identificación del suscriptor, Hechos numerados, Contradicciones/Incumplimientos probados, Fundamentos de Derecho, Pruebas/Anexos, Peticiones principales y subsidiarias, Notificaciones y Firma).
 
 ## 11. CHECKLIST DE VERIFICACIÓN ANTES DE RADICAR
-(Lista de chequeo detallada para validar anexos, firmas, correos de notificación y folios antes de enviar).
+(Lista de chequeo práctica de anexos, firmas, traslado previo y correos antes de radicar).
 """
     return prompt
 
@@ -757,6 +923,7 @@ def construir_prompt_consultor_desde_cero(
     documento_a_generar,
     incluir_docs_cargados,
     items,
+    datos_firmante,
     limite_chars_por_doc=80000
 ):
     contexto_expediente = "NO SE ADJUNTARON DOCUMENTOS (CONSULTA PREVENTIVA / DESDE CERO)."
@@ -768,81 +935,94 @@ def construir_prompt_consultor_desde_cero(
 
     prompt = f"""
 Actúa como un **Abogado Litigante Colombiano Senior y Consultor Estratégico Especialista en todas las jurisdicciones y entidades de Colombia**.
-El usuario necesita orientación jurídica precisa sobre **qué hacer frente a un problema jurídico o actuación que aún no ha realizado (o que está por iniciar)**, de acuerdo estrictamente con las leyes colombianas vigentes.
+Orienta al usuario con precisión quirúrgica sobre **qué hacer frente a su problema jurídico o actuación por iniciar**, conforme a las leyes colombianas vigentes.
 
 {MARCO_JURIDICO_COLOMBIA}
 
-DATOS DEL PROBLEMA O CASO PLANTEADO POR EL USUARIO:
+DATOS DEL PROBLEMA PLANTEADO:
 - **Área / Naturaleza del Caso:** {tipo_proceso}
-- **Entidad / Autoridad / Contraparte Involucrada:** {entidad_especifica or 'Por definir según la ley colombiana'}
+- **Entidad / Autoridad / Contraparte Involucrada:** {entidad_especifica or 'Determinar según ley colombiana'}
 - **Rol del Usuario:** {rol_usuario}
-- **Documento Principal que el Usuario desea obtener redactado al final:** {documento_a_generar}
+- **Documento Principal a Redactar en la Sección 7:** {documento_a_generar}
 
-DESCRIPCIÓN DETALLADA DEL PROBLEMA / INCONVENIENTE DEL USUARIO:
+DATOS DEL SUSCRIPTOR PARA FIRMAR EL DOCUMENTO:
+{formatear_datos_firmante(datos_firmante)}
+
+DESCRIPCIÓN DEL PROBLEMA DEL USUARIO:
 \"\"\"
 {problema_descrito}
 \"\"\"
 
-DOCUMENTOS DE SOPORTE CARGADOS EN SESIÓN (SI APLICAN):
+DOCUMENTOS DE SOPORTE EN SESIÓN (SI APLICAN):
 {contexto_expediente}
 
 REGLAS DE FORMATO:
-- NO uses barras verticales `|` dentro de paréntesis o corchetes de citas para no alterar las tablas de Word.
-- Sé sumamente específico con las leyes colombianas (cita número de ley, artículos aplicables y jurisprudencia).
+- NO uses barras verticales `|` dentro de paréntesis o corchetes de citas.
+- Cita leyes, artículos y sentencias exactas de Colombia.
 
-GENERA UNA GUÍA JURÍDICA ESTRATÉGICA Y EL DOCUMENTO LISTO PARA RADICAR CON ESTA ESTRUCTURA EN MARKDOWN:
+GENERA LA ESTRATEGIA Y EL ESCRITO LISTO PARA RADICAR CON ESTA ESTRUCTURA EN MARKDOWN:
 
 # DICTAMEN DE ESTRATEGIA JURÍDICA Y HOJA DE RUTA (COLOMBIA)
 
 ## 1. DIAGNÓSTICO JURÍDICO DEL PROBLEMA Y VIABILIDAD
-(Explica qué figura jurídica se configura en Colombia con este problema, qué derechos o normas se están vulnerando y qué tan viable es reclamar).
-
 ## 2. ENTIDADES COMPETENTES: ¿ANTE QUIÉN ACUDIR Y POR QUÉ?
-(Tabla Markdown de 4 columnas: `Entidad o Despacho Competente` | `Trámite o Acción a Interponer` | `Facultad de la Entidad (Sancionatoria, Jurisdiccional, Control, etc.)` | `Plazo de Respuesta o Término Legal`).
-
+(Tabla Markdown de 4 columnas: `Entidad o Despacho Competente` | `Trámite o Acción a Interponer` | `Facultad de la Entidad` | `Plazo Legal de Respuesta`).
 ## 3. LEYES COLOMBIANAS Y ARTÍCULOS EXACTOS QUE TE RESPALDAN
-(Desglose claro de las leyes, decretos y sentencias aplicables al caso, explicando cómo usar cada artículo a favor del usuario).
-
-## 4. REQUISITOS DE PROCEDIBILIDAD, CADUCIDAD Y ERRORES QUE DEBES EVITAR
-(¡MUY IMPORTANTE! Explica si antes de demandar o quejarse debe agotar reclamo directo, derecho de petición, conciliación extrajudicial o recurso previo; cuáles son los tiempos de prescripción/caducidad y qué errores hacen que las entidades rechacen este trámite).
-
+## 4. REQUISITOS DE PROCEDIBILIDAD, CADUCIDAD Y ERRORES A EVITAR
 ## 5. RUTA DE ACCIÓN PASO A PASO: QUÉ HACER DESDE HOY
-(Guía numerada y cronológica:
-- **Paso 1 (Preparación y Pruebas):** Qué documentos, fotos, certificados, contratos, historias clínicas o actas debe reunir.
-- **Paso 2 (Actuación Principal):** Cómo y dónde radicar el escrito principal (ventanilla virtual, correo institucional, plataforma de la SIC/Supersalud/Procuraduría/Rama Judicial).
-- **Paso 3 (Plan B y Escalamiento):** Qué hacer si la entidad guarda silencio, niega la petición o incumple).
-
 ## 6. MATRIZ ESTRATÉGICA DE ACTUACIONES RECOMENDADAS
 (Tabla Markdown de 5 columnas: `Orden` | `Actuación a Realizar` | `Ante Qué Entidad` | `Resultado Esperado` | `Fundamento Legal`).
-
-## 7. BORRADOR COMPLETO DE: {documento_a_generar.upper()} (LISTO PARA RADICAR)
-(Redacta de forma completa, extensa, rigurosa y persuasiva el documento solicitado —**{documento_a_generar}**— adaptado al relato del usuario y a los documentos cargados si los hay. Incluye: Ciudad y fecha, Destinatario exacto, Asunto/Referencia, Identificación del accionante/peticionario, Hechos claros y numerados, Fundamentos Constitucionales y Legales, Pruebas y Anexos, Solicitudes/Peticiones Principales y Subsidiarias, Notificaciones y Firma).
-
+## 7. BORRADOR COMPLETO DE: {documento_a_generar.upper()}
+(IMPORTANTE: Redacta aquí ÚNICAMENTE el documento jurídico formal completo y listo para firmar y radicar, con todos los requisitos de ley colombiana).
 ## 8. CHECKLIST DE PRUEBAS Y ANEXOS NECESARIOS
-(Lista de chequeo de los soportes exactos que el usuario debe adjuntar a este documento antes de enviarlo).
 """
     return prompt
 
-# =====================================================================
-# INTERFAZ PRINCIPAL DE STREAMLIT
-# =====================================================================
-st.markdown("""
-<div class="main-header">
-    <h2 style="margin:0;">⚖️ Suite Jurídica IA Colombia: Auditor de Expedientes y Estratega Legal</h2>
-    <p style="margin:0.3rem 0 0 0; opacity:0.9;">
-        Auditoría forense de contradicciones en PDFs, consultoría para actuaciones aún no realizadas y generación de escritos en Word (.docx) para cualquier entidad
-    </p>
-</div>
-""", unsafe_allow_html=True)
+def construir_prompt_abogado_diablo(borrador_usuario, tipo_proceso, entidad_especifica, datos_firmante):
+    return f"""
+Actúa simultáneamente en dos fases como:
+1) **Juez Estricto / Abogado Senior de la Contraparte en Colombia ("Abogado del Diablo")** que examina el escrito buscando cualquier fisura para inadmitirlo, rechazarlo o ganarle con excepciones.
+2) **Magistrado / Litigante Maestro de Blindaje** que corrige cada fisura encontrada y entrega una versión blindada, implacable y lista para radicar.
 
-# ----------------- BARRA LATERAL (CONFIGURACIÓN UNIVERSAL) -----------------
+{MARCO_JURIDICO_COLOMBIA}
+
+CONTEXTO:
+- Trámite / Jurisdicción: {tipo_proceso}
+- Entidad / Contraparte: {entidad_especifica or 'Según escrito'}
+- Datos del Suscriptor:
+{formatear_datos_firmante(datos_firmante)}
+
+ESCRITO A SOMETER A PRUEBA DE FUEGO:
+\"\"\"
+{borrador_usuario}
+\"\"\"
+
+ENTREGA EL RESULTADO CON ESTA ESTRUCTURA EN MARKDOWN (SIN USAR `|` DENTRO DE CITAS):
+
+# AUDITORÍA DE BLINDAJE ("ABOGADO DEL DIABLO") Y VERSIÓN REFORZADA
+
+## 1. ATAQUES QUE HARÍA LA CONTRAPARTE O CAUSALES DE INADMISIÓN DEL JUEZ
+(Tabla Markdown de 4 columnas: `N°` | `Debilidad o Riesgo Detectado en el Escrito` | `Cómo lo Atacaría la Contraparte o el Juez` | `Solución Jurídica Aplicada para Blindarlo`).
+
+## 2. PRUEBAS O REQUISITOS FORMALES QUE FALTABAN MENCIONAR
+(Revisión de juramento estimatorio, medida provisional, agotamiento de reclamación directa/procedibilidad, traslado Ley 2213 de 2022, legitimación por activa/pasiva o competencia).
+
+## 7. BORRADOR COMPLETO DE: ESCRITO 100% BLINDADO Y CORREGIDO LISTO PARA RADICAR
+(Redacta aquí la versión final perfeccionada, contundente y blindada del documento, lista para firmar y radicar).
+
+## 8. CHECKLIST FINAL DE RADICACIÓN SEGURA
+"""
+
+# =====================================================================
+# BARRA LATERAL: CONFIGURACIÓN, ANTI-CPU Y DATOS DEL FIRMANTE
+# =====================================================================
 with st.sidebar:
-    st.header("🔑 Configuración del Motor IA")
+    st.header("🔑 Motor IA & Rendimiento")
     api_key_input = st.text_input(
         "Google Gemini API Key",
-        value=os.environ.get("GOOGLE_API_KEY", ""),
+        value=obtener_api_key_inicial(),
         type="password",
-        help="Ingresa tu clave de Google AI Studio. Se mantiene segura en la memoria temporal de tu sesión."
+        help="Pega tu clave de Google AI Studio. Si la configuras en 'Secrets' de Streamlit como GOOGLE_API_KEY, cargará sola siempre."
     )
 
     modelo_sel = st.selectbox(
@@ -859,13 +1039,19 @@ with st.sidebar:
         index=0
     )
 
-    usar_ocr_vision = st.toggle(
-        "Activar OCR en páginas escaneadas",
-        value=True
+    modo_ocr_sel = st.selectbox(
+        "⚡ Motor OCR (Anti-Bloqueo CPU)",
+        options=[
+            "Nube Gemini Vision (0% CPU Local - Recomendado)",
+            "Tesseract Local Ligero (130 DPI)",
+            "Desactivado (Solo PDFs Digitales - Ultra Rápido)"
+        ],
+        index=0,
+        help="¡Clave para evitar que Streamlit limite tu CPU! 'Nube Gemini Vision' delega la lectura de páginas escaneadas a los servidores de Google sin gastar procesador de Streamlit."
     )
 
     st.divider()
-    st.header("🏛️ Jurisdicción y Entidad")
+    st.header("🏛️ Jurisdicción y Caso")
 
     tipo_proceso = st.selectbox(
         "1. Área o Naturaleza del Trámite",
@@ -885,12 +1071,12 @@ with st.sidebar:
     )
 
     entidad_especifica = st.text_input(
-        "2. Nombre de la Entidad, Juzgado o Contraparte (Opcional)",
-        placeholder="Ej: SIC, Procuraduría, Personería de Madrid, Juzgado Promiscuo, Constructora, EPS..."
+        "2. Entidad, Juzgado o Contraparte",
+        placeholder="Ej: SIC, Procuraduría, Personería, Juzgado, Constructora, EPS..."
     )
 
     rol_usuario = st.selectbox(
-        "3. Tu Rol en el Caso",
+        "3. Tu Rol Procesal",
         options=[
             "Demandante / Accionante / Quejoso / Peticionario / Agente Oficioso / Veedor",
             "Demandado / Entidad Convocada / Investigado / Defensa Técnica",
@@ -898,8 +1084,24 @@ with st.sidebar:
         ]
     )
 
+    with st.expander("👤 Mis Datos para Firmar Escritos (Opcional)"):
+        st.caption("Se insertan automáticamente en tus memoriales, tutelas, quejas o derechos de petición:")
+        firmante_nombre = st.text_input("Nombre Completo", placeholder="Ej: Juan Pérez Gómez")
+        firmante_doc = st.text_input("Cédula / NIT / T.P.", placeholder="Ej: C.C. 1.000.000.000")
+        firmante_ciudad = st.text_input("Ciudad y Departamento", placeholder="Ej: Bogotá D.C.")
+        firmante_correo = st.text_input("Correo de Notificaciones", placeholder="Ej: correo@ejemplo.com")
+        firmante_tel = st.text_input("Celular / Teléfono", placeholder="Ej: 300 000 0000")
+
+    datos_firmante_dict = {
+        "nombre": firmante_nombre.strip(),
+        "documento": firmante_doc.strip(),
+        "ciudad": firmante_ciudad.strip(),
+        "correo": firmante_correo.strip(),
+        "telefono": firmante_tel.strip()
+    }
+
     limite_chars = st.slider(
-        "Capacidad de lectura por documento (caracteres)",
+        "Capacidad de lectura por archivo (caracteres)",
         min_value=20000,
         max_value=250000,
         value=120000,
@@ -907,57 +1109,90 @@ with st.sidebar:
     )
 
     st.divider()
-    if st.button("🗑️ Limpiar Sesión y Memoria", use_container_width=True):
-        st.session_state.expediente_docs = []
-        st.session_state.actuaciones_df = pd.DataFrame()
-        st.session_state.catalogo_df = pd.DataFrame()
-        st.session_state.informe_md = ""
-        st.session_state.estrategia_md = ""
-        st.session_state.historial_chat = []
+    if st.button("🗑️ Limpiar Sesión y Memoria RAM", use_container_width=True):
+        for k_limpiar in DEFAULTS_SESION:
+            st.session_state[k_limpiar] = [] if isinstance(DEFAULTS_SESION[k_limpiar], list) else (
+                {} if isinstance(DEFAULTS_SESION[k_limpiar], dict) else (
+                    pd.DataFrame() if isinstance(DEFAULTS_SESION[k_limpiar], pd.DataFrame) else ""
+                )
+            )
+        gc.collect()
         st.rerun()
 
-# ----------------- PESTAÑAS DE LA SUITE JURÍDICA -----------------
-tab_carga, tab_auditoria, tab_consultor, tab_rag, tab_export = st.tabs([
-    "📂 1. Subir Expediente",
-    "🔍 2. Auditar Expediente y Contradicciones",
-    "🧰 3. Caja de Herramientas: ¿Qué Hacer? (Con o Sin Expediente)",
-    "💬 4. Chat con el Expediente",
-    "📄 5. Descargar Word y Excel"
+# =====================================================================
+# CABECERA EJECUTIVA E INDICADORES DE ESTADO EN TIEMPO REAL
+# =====================================================================
+num_archivos_cargados = len(st.session_state.expediente_docs)
+num_folios_cargados = sum(d["num_paginas"] for d in st.session_state.expediente_docs)
+pill_ia = '<span class="status-pill status-pill-ok">🟢 Motor Gemini Conectado</span>' if api_key_input else '<span class="status-pill status-pill-warn">🟠 Ingresa tu API Key en el panel izquierdo</span>'
+
+st.markdown(f"""
+<div class="main-header">
+    <h2 style="margin:0; font-weight:800;">⚖️ Bufete Litigante IA Colombia — Suite Forense & Estrategia Legal</h2>
+    <p style="margin:0.35rem 0 0 0; opacity:0.92; font-size:0.98rem;">
+        Auditoría cruzada de contradicciones en expedientes, redacción jurídica multijurisdiccional, simulador de contraparte y control de términos hábiles
+    </p>
+</div>
+<div class="status-bar">
+    {pill_ia}
+    <span class="status-pill status-pill-ok">⚡ Protección Anti-Bloqueo CPU Activa (Caché SHA-256 + OCR Optimizado)</span>
+    <span class="status-pill">📁 Expediente en Memoria: {num_archivos_cargados} archivos ({num_folios_cargados} folios)</span>
+</div>
+""", unsafe_allow_html=True)
+
+# ----------------- SEIS PESTAÑAS DE LITIGIO INTEGRAL -----------------
+tab_carga, tab_auditoria, tab_consultor, tab_blindaje, tab_rag, tab_export = st.tabs([
+    "📂 1. Expediente Digital",
+    "🔍 2. Auditar Contradicciones",
+    "🧰 3. ¿Qué Hacer? (Desde Cero)",
+    "⚔️ 4. Blindaje y Términos Legales",
+    "💬 5. Sala de Interrogatorio (Chat)",
+    "📄 6. Bóveda Word y Excel"
 ])
 
 # =====================================================================
-# PESTAÑA 1: CARGA, OCR E INVENTARIO DOCUMENTAL
+# PESTAÑA 1: CARGA INCREMENTAL CON CACHÉ ANTI-CPU
 # =====================================================================
 with tab_carga:
-    st.subheader("📤 Subir Archivos del Expediente, Demanda, Petición o Pruebas")
-    st.caption("Puedes subir expedientes judiciales completos, respuestas de entidades, oficios, contratos, promesas de compraventa, folletos publicitarios o historias clínicas.")
+    st.subheader("📤 Cargar Documentos del Expediente, Demanda, Oficios o Pruebas")
+    st.caption("Sistema con huella digital SHA-256: si agregas archivos nuevos más adelante, los documentos ya leídos se recuperan al instante sin volver a gastar CPU.")
+
     archivos_subidos = st.file_uploader(
-        "Selecciona tus archivos (PDF, DOCX, TXT o RTF)",
+        "Arrastra aquí tus archivos (PDF, DOCX, TXT o RTF)",
         type=["pdf", "docx", "txt", "rtf"],
         accept_multiple_files=True
     )
 
-    col_btn1, col_btn2 = st.columns([1, 2])
-    with col_btn1:
-        procesar_btn = st.button("⚙️ Procesar e Indexar Documentos", type="primary", use_container_width=True)
+    col_b1, col_b2 = st.columns([1, 2])
+    with col_b1:
+        procesar_btn = st.button("⚙️ Procesar e Indexar Expediente", type="primary", use_container_width=True)
 
     if procesar_btn:
         if not archivos_subidos:
-            st.warning("⚠️ Selecciona al menos un archivo para procesar, o ve directo a la Pestaña 3 si deseas hacer una consulta jurídica desde cero sin documentos.")
+            st.warning("⚠️ Selecciona al menos un archivo para procesar, o ve directo a la Pestaña 3 si deseas consultar un caso desde cero.")
         else:
+            if modo_ocr_sel.startswith("Nube") and not api_key_input:
+                st.info("💡 Consejo: Ingresa tu API Key en la barra izquierda antes de procesar PDFs escaneados para que el OCR corra en la nube de Google con 0% de uso de CPU local.")
+
             cliente_tmp = obtener_cliente_gemini(api_key_input) if api_key_input else None
             docs_procesados = []
-            barra = st.progress(0, text="Iniciando lectura paginada de documentos...")
+            barra = st.progress(0, text="Iniciando lectura inteligente con ahorro de CPU...")
 
             for idx, arch in enumerate(archivos_subidos):
                 barra.progress(
-                    (idx) / len(archivos_subidos),
-                    text=f"Extrayendo texto y folios de: {arch.name} ({idx+1}/{len(archivos_subidos)})..."
+                    idx / len(archivos_subidos),
+                    text=f"Analizando {arch.name} ({idx + 1} de {len(archivos_subidos)})..."
                 )
-                item_doc = procesar_archivo_subido(arch, client=cliente_tmp, usar_ocr_ia=usar_ocr_vision)
+                item_doc = procesar_archivo_subido(
+                    arch,
+                    api_key=api_key_input,
+                    client=cliente_tmp,
+                    modo_ocr=modo_ocr_sel
+                )
                 docs_procesados.append(item_doc)
 
-            barra.progress(1.0, text="¡Extracción completada!")
+            gc.collect()
+            barra.progress(1.0, text="¡Expediente indexado y memoria liberada!")
             st.session_state.expediente_docs = docs_procesados
 
             filas_cat = []
@@ -965,10 +1200,10 @@ with tab_carga:
                 filas_cat.append({
                     "Archivo": it["nombre"],
                     "Páginas": it["num_paginas"],
-                    "Págs con OCR": len(it["paginas_ocr"]),
-                    "Caracteres Extraídos": it["caracteres"],
+                    "Págs OCR": len(it["paginas_ocr"]),
+                    "Caracteres": it["caracteres"],
                     "Radicado Detectado": it["meta"]["radicado"],
-                    "Actuaciones Detectadas": ", ".join(it["meta"]["tipo_actuacion"][:4]) or "General",
+                    "Actuaciones": ", ".join(it["meta"]["tipo_actuacion"][:4]) or "General",
                     "Actor / Solicitante": it["meta"]["actor"],
                     "Demandado / Entidad": it["meta"]["demandado"],
                     "Oficio / Auto": it["meta"]["numero_oficio"],
@@ -976,45 +1211,56 @@ with tab_carga:
                 })
             st.session_state.catalogo_df = pd.DataFrame(filas_cat)
             st.session_state.actuaciones_df = extraer_linea_tiempo_regex(docs_procesados)
-            st.success(f"✅ Se procesaron exitosamente {len(docs_procesados)} documentos con trazabilidad página por página.")
+            st.success(f"✅ {len(docs_procesados)} documentos indexados correctamente con protección de CPU activada.")
+            st.rerun()
 
     if st.session_state.expediente_docs:
         docs_mem = st.session_state.expediente_docs
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("📁 Documentos Cargados", len(docs_mem))
+        m1.metric("📁 Archivos en Bóveda", len(docs_mem))
         m2.metric("📄 Total Páginas / Folios", sum(d["num_paginas"] for d in docs_mem))
-        m3.metric("🔍 Páginas Recuperadas con OCR", sum(len(d["paginas_ocr"]) for d in docs_mem))
-        m4.metric("📝 Caracteres Totales Leídos", f"{sum(d['caracteres'] for d in docs_mem):,}")
+        m3.metric("🔍 Folios Leídos con OCR", sum(len(d["paginas_ocr"]) for d in docs_mem))
+        m4.metric("📝 Caracteres Extraídos", f"{sum(d['caracteres'] for d in docs_mem):,}")
 
-        st.markdown("#### 📋 Catálogo Documental Detectado")
+        st.markdown("#### 📋 Inventario Técnico del Expediente")
         st.dataframe(st.session_state.catalogo_df, use_container_width=True)
 
-        with st.expander("🕒 Ver Línea de Tiempo Preliminar (Fechas de 4 dígitos corregidas)"):
-            st.dataframe(st.session_state.actuaciones_df, use_container_width=True)
+        col_exp_a, col_exp_b = st.columns(2)
+        with col_exp_a:
+            with st.expander("🕒 Línea de Tiempo Detectada Automáticamente"):
+                st.dataframe(st.session_state.actuaciones_df, use_container_width=True)
+        with col_exp_b:
+            with st.expander("🔎 Visor de Folios Extraídos por Documento"):
+                nombres_arch = [d["nombre"] for d in docs_mem]
+                arch_sel = st.selectbox("Selecciona un archivo:", nombres_arch)
+                doc_ver = next(d for d in docs_mem if d["nombre"] == arch_sel)
+                st.text_area(
+                    f"Vista previa de {arch_sel}:",
+                    value=doc_ver["raw"][:20000],
+                    height=240
+                )
 
 # =====================================================================
-# PESTAÑA 2: AUDITORÍA DE EXPEDIENTES Y CONTRADICCIONES
+# PESTAÑA 2: AUDITORÍA FORENSE DE CONTRADICCIONES + DOBLE WORD
 # =====================================================================
 with tab_auditoria:
-    st.subheader("🔍 Auditoría Forense de Contradicciones e Informe de Actuación")
-    st.write("Cruza todos los PDFs cargados en la Pestaña 1, detecta contradicciones fácticas, técnicas y normativas, y redacta el memorial o actuación que debes presentar.")
+    st.subheader("🔍 Auditoría Forense de Contradicciones, Pruebas y Plan de Acción")
+    st.write("Cruza todos los folios de tus PDFs para descubrir mentiras, contradicciones fácticas o errores judiciales/administrativos, indicándote qué hacer y redactando el memorial.")
 
     enfoque_usuario = st.text_area(
-        "🎯 Instrucciones específicas o puntos que quieres revisar con lupa en estos PDFs (Opcional):",
-        placeholder="Ejemplo: Revisar las contradicciones entre la promesa/publicidad inicial y las respuestas de la entidad o constructora; verificar incumplimientos de autos u oficios; proponer qué hacer y redactar el memorial o recurso.",
-        height=100
+        "🎯 ¿Qué contradicciones, incumplimientos o puntos críticos quieres que tu Abogado IA revise con lupa? (Opcional):",
+        placeholder="Ejemplo: Cruzar lo prometido en publicidad o en la sentencia frente a lo que respondió la constructora, EPS, alcaldía o juzgado en los oficios recientes; detectar vacíos probatorios y redactar el memorial listo para radicar.",
+        height=95
     )
 
-    generar_informe_btn = st.button("🚀 Ejecutar Auditoría Completa del Expediente", type="primary", use_container_width=True)
-
-    if generar_informe_btn:
+    if st.button("🚀 Ejecutar Auditoría Forense del Expediente", type="primary", use_container_width=True):
         if not api_key_input:
             st.error("❌ Ingresa tu Google Gemini API Key en la barra lateral izquierda.")
         elif not st.session_state.expediente_docs:
-            st.warning("⚠️ Primero sube y procesa los documentos en la Pestaña 1 (o usa la Pestaña 3 si aún no tienes expediente).")
+            st.warning("⚠️ Primero carga tus documentos en la Pestaña 1 (o usa la Pestaña 3 si aún no tienes documentos).")
         else:
             client = obtener_cliente_gemini(api_key_input)
-            prompt_auditoria = construir_prompt_auditoria(
+            prompt_aud = construir_prompt_auditoria(
                 items=st.session_state.expediente_docs,
                 catalogo_df=st.session_state.catalogo_df,
                 actuaciones_df=st.session_state.actuaciones_df,
@@ -1022,47 +1268,68 @@ with tab_auditoria:
                 entidad_especifica=entidad_especifica,
                 rol_usuario=rol_usuario,
                 enfoque_especial=enfoque_usuario,
+                datos_firmante=datos_firmante_dict,
                 limite_chars_por_doc=limite_chars
             )
 
-            with st.spinner("⚖️ Cruzando todos los documentos del expediente, verificando leyes colombianas y redactando el informe..."):
+            with st.spinner("⚖️ Auditando folios en la nube de Gemini, cruzando pruebas y redactando informe + memorial..."):
                 try:
                     texto_informe, modelo_usado = llamar_gemini(
                         client=client,
-                        prompt_contents=prompt_auditoria,
+                        api_key=api_key_input,
+                        prompt_contents=prompt_aud,
                         modelo_preferido=modelo_sel,
                         temperatura=0.1
                     )
                     st.session_state.informe_md = texto_informe
-                    st.success(f"✅ Auditoría completada con `{modelo_usado}`. Las tablas de Word ya están blindadas para no desajustar columnas.")
+                    st.success(f"✅ Auditoría completada con `{modelo_usado}`.")
                 except Exception as e:
-                    st.error(f"❌ Error al generar el informe: {str(e)}")
+                    st.error(f"❌ Error al generar la auditoría: {str(e)}")
 
     if st.session_state.informe_md:
-        word_bytes_top = convertir_markdown_a_docx_bytes(
-            st.session_state.informe_md,
-            titulo_portada="INFORME DE AUDITORÍA PROCESAL Y PLAN DE ACCIÓN"
-        )
-        st.download_button(
-            label="📥 Descargar Informe de Auditoría en Word (.docx)",
-            data=word_bytes_top,
-            file_name=f"Informe_Auditoria_Expediente_{datetime.now().strftime('%Y%m%d_%H%M')}.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            type="primary"
-        )
+        col_dl1, col_dl2 = st.columns(2)
+        with col_dl1:
+            word_completo = convertir_markdown_a_docx_bytes(
+                st.session_state.informe_md,
+                titulo_portada="INFORME DE AUDITORÍA PROCESAL Y PLAN DE ACCIÓN",
+                incluir_portada=True
+            )
+            st.download_button(
+                label="📘 Descargar Informe Completo de Auditoría (.docx)",
+                data=word_completo,
+                file_name=f"Informe_Auditoria_Completo_{datetime.now().strftime('%Y%m%d_%H%M')}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                type="primary",
+                use_container_width=True
+            )
+        with col_dl2:
+            solo_memorial_md = extraer_solo_borrador_radicable(st.session_state.informe_md)
+            if solo_memorial_md:
+                word_memorial = convertir_markdown_a_docx_bytes(
+                    solo_memorial_md,
+                    titulo_portada="",
+                    incluir_portada=False
+                )
+                st.download_button(
+                    label="⚖️ Descargar SOLO el Memorial Limpio para Radicar (.docx)",
+                    data=word_memorial,
+                    file_name=f"Memorial_Listo_Para_Radicar_{datetime.now().strftime('%Y%m%d_%H%M')}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True
+                )
+
         st.divider()
         st.markdown(st.session_state.informe_md)
 
 # =====================================================================
-# PESTAÑA 3: CAJA DE HERRAMIENTAS - CONSULTOR Y ESTRATEGA DESDE CERO
+# PESTAÑA 3: CONSULTOR Y ESTRATEGA DESDE CERO (CON O SIN EXPEDIENTE)
 # =====================================================================
 with tab_consultor:
     st.markdown("""
     <div class="tool-box">
-        <h3 style="margin-top:0; color:#1e3a8a;">🧰 Caja de Herramientas: Consultor Jurídico y Generador de Actuaciones Desde Cero</h3>
+        <h3 style="margin-top:0; color:#1e3a8a;">🧰 Tu Abogado Estratega Desde Cero (Para Actuaciones Nuevas o Problemas Legales)</h3>
         <p style="margin-bottom:0;">
-            ¿Tienes un inconveniente jurídico, administrativo, inmobiliario, de salud, servicios públicos o ante cualquier entidad y <b>quieres saber qué hacer según las leyes colombianas o redactar una actuación que aún no has realizado</b>?
-            Describe tu caso aquí abajo. Funciona <b>incluso sin subir documentos</b>, o puedes combinarlo con los PDFs que hayas subido en la Pestaña 1.
+            Cuéntale tu caso o inconveniente en lenguaje natural. El sistema analiza qué leyes colombianas te protegen, ante qué entidades acudir, qué plazos cuidar y <b>te entrega redactado tanto el Plan Estratégico como el Escrito Limpio en Word listo para radicar</b>.
         </p>
     </div>
     """, unsafe_allow_html=True)
@@ -1071,43 +1338,42 @@ with tab_consultor:
 
     with col_c1:
         problema_descrito = st.text_area(
-            "✍️ Describe aquí tu inconveniente, caso o lo que necesitas lograr (incluye hechos, fechas aproximadas, entidad o persona involucrada y qué te han dicho):",
-            placeholder="Ejemplo 1: Compré un lote en un proyecto urbanístico donde prometieron servicios públicos de acueducto, energía y zonas comunes, pero han pasado años y no han cumplido ni entregado las obras urbanísticas. ¿Qué acciones debo iniciar ante la SIC, Alcaldía o Procuraduría/Personería y en qué orden?\n\nEjemplo 2: Una entidad pública o juzgado no ha respondido mi solicitud o tomó una decisión ignorando una prueba clave. ¿Qué recurso, queja disciplinaria o acción procede?",
-            height=190
+            "✍️ Describe detalladamente tu problema jurídico, administrativo, contractual, inmobiliario o judicial:",
+            placeholder="Ejemplo: Compré un lote o inmueble donde ofrecieron servicios públicos y obras urbanísticas que no han entregado; o una entidad/juzgado vulneró mis derechos o guarda silencio frente a una petición. Describe fechas aproximadas, nombres de entidades/personas y qué buscas lograr.",
+            height=195
         )
 
     with col_c2:
         documento_a_generar = st.selectbox(
-            "📝 ¿Qué documento o actuación quieres que te redacte listo para radicar?",
+            "📝 Escrito a redactar listo para radicar:",
             options=[
-                "Diagnóstico Estratégico + Borrador del Escrito Más Efectivo",
                 "Derecho de Petición Blindado (Ley 1755 de 2015)",
-                "Demanda o Queja ante Superintendencia (SIC / Supersalud / Superservicios)",
-                "Queja Disciplinaria o Solicitud de Vigilancia (Procuraduría / Personería / Comisión Disciplina)",
-                "Acción de Tutela con Solicitud de Medida Provisional",
-                "Incidente de Desacato / Memorial de Impulso Procesal",
+                "Demanda Jurisdiccional o Queja ante la SIC (Ley 1480 de 2011 - Consumidor / Publicidad Engañosa)",
+                "Queja Disciplinaria o Vigilancia (Procuraduría / Personería / Comisión de Disciplina Judicial)",
+                "Acción de Tutela con Medida Provisional Urgente",
+                "Impugnación de Fallo de Tutela (Dentro de los 3 días)",
+                "Incidente de Desacato / Solicitud de Cumplimiento de Sentencia",
                 "Recurso de Reposición y en Subsidio de Apelación",
+                "Acción Popular o Acción de Cumplimiento (Espacio Público / Urbanismo / Comunidad)",
                 "Reclamación Directa Previa / Requerimiento Prejudicial",
-                "Querella Policiva / Solicitud de Verificación Urbanística ante Alcaldía/Planeación",
-                "Denuncia Penal formal ante la Fiscalía General de la Nación"
+                "Contestación de Demanda / Escrito de Defensa y Excepciones",
+                "Denuncia Penal Formal ante la Fiscalía General de la Nación"
             ]
         )
 
         incluir_docs_cargados = st.checkbox(
-            "📎 Apoyarse también en los PDFs subidos en la Pestaña 1 (si subiste alguno)",
+            "📎 Cruzar también con los documentos cargados en la Pestaña 1",
             value=bool(st.session_state.expediente_docs)
         )
 
-    btn_consultar_problema = st.button("⚖️ Analizar Problema con Leyes Colombianas y Redactar Documento", type="primary", use_container_width=True)
-
-    if btn_consultar_problema:
+    if st.button("⚖️ Diseñar Estrategia Legal Colombiana y Redactar Escrito", type="primary", use_container_width=True):
         if not api_key_input:
             st.error("❌ Ingresa tu Google Gemini API Key en la barra lateral izquierda.")
         elif not problema_descrito or len(problema_descrito.strip()) < 15:
-            st.warning("⚠️ Por favor describe tu problema o caso en el cuadro de texto para poder darte una estrategia precisa.")
+            st.warning("⚠️ Describe tu caso o inconveniente con al menos un párrafo breve para darte una asesoría exacta.")
         else:
             client = obtener_cliente_gemini(api_key_input)
-            prompt_estrategia = construir_prompt_consultor_desde_cero(
+            prompt_est = construir_prompt_consultor_desde_cero(
                 problema_descrito=problema_descrito,
                 tipo_proceso=tipo_proceso,
                 entidad_especifica=entidad_especifica,
@@ -1115,84 +1381,266 @@ with tab_consultor:
                 documento_a_generar=documento_a_generar,
                 incluir_docs_cargados=incluir_docs_cargados,
                 items=st.session_state.expediente_docs,
+                datos_firmante=datos_firmante_dict,
                 limite_chars_por_doc=limite_chars
             )
 
-            with st.spinner("⚖️ Consultando legislación colombiana, diseñando hoja de ruta procesal y redactando tu escrito..."):
+            with st.spinner("⚖️ Analizando legislación y jurisprudencia colombiana y redactando tu documento..."):
                 try:
                     texto_estrategia, modelo_usado = llamar_gemini(
                         client=client,
-                        prompt_contents=prompt_estrategia,
+                        api_key=api_key_input,
+                        prompt_contents=prompt_est,
                         modelo_preferido=modelo_sel,
                         temperatura=0.15
                     )
                     st.session_state.estrategia_md = texto_estrategia
-                    st.success(f"✅ Estrategia jurídica y borrador generados con éxito (`{modelo_usado}`). Descárgalo en Word aquí abajo.")
+                    st.success(f"✅ Estrategia y escrito generados con `{modelo_usado}`.")
                 except Exception as e:
-                    st.error(f"❌ Error al generar la consultoría: {str(e)}")
+                    st.error(f"❌ Error al generar la estrategia: {str(e)}")
 
     if st.session_state.estrategia_md:
-        word_estrategia = convertir_markdown_a_docx_bytes(
-            st.session_state.estrategia_md,
-            titulo_portada="CONCEPTO JURÍDICO ESTRATÉGICO Y BORRADOR DE ACTUACIÓN"
-        )
-        st.download_button(
-            label="📥 Descargar Estrategia y Borrador en Word (.docx)",
-            data=word_estrategia,
-            file_name=f"Estrategia_Juridica_Colombia_{datetime.now().strftime('%Y%m%d_%H%M')}.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            type="primary"
-        )
+        col_ed1, col_ed2 = st.columns(2)
+        with col_ed1:
+            word_est_full = convertir_markdown_a_docx_bytes(
+                st.session_state.estrategia_md,
+                titulo_portada="DICTAMEN DE ESTRATEGIA JURÍDICA Y HOJA DE RUTA",
+                incluir_portada=True
+            )
+            st.download_button(
+                label="🧭 Descargar Estrategia + Borrador Completo (.docx)",
+                data=word_est_full,
+                file_name=f"Estrategia_Juridica_{datetime.now().strftime('%Y%m%d_%H%M')}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                type="primary",
+                use_container_width=True
+            )
+        with col_ed2:
+            solo_escrito_est = extraer_solo_borrador_radicable(st.session_state.estrategia_md)
+            if solo_escrito_est:
+                word_est_limpio = convertir_markdown_a_docx_bytes(
+                    solo_escrito_est,
+                    titulo_portada="",
+                    incluir_portada=False
+                )
+                st.download_button(
+                    label="⚖️ Descargar SOLO el Escrito Limpio para Radicar (.docx)",
+                    data=word_est_limpio,
+                    file_name=f"Escrito_Radicable_{datetime.now().strftime('%Y%m%d_%H%M')}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True
+                )
+
         st.divider()
         st.markdown(st.session_state.estrategia_md)
 
 # =====================================================================
-# PESTAÑA 4: CONSULTOR DIRECTO AL EXPEDIENTE (CHAT CON TRAZABILIDAD)
+# PESTAÑA 4: SIMULADOR "ABOGADO DEL DIABLO" + CALCULADORA DE TÉRMINOS COLOMBIA
+# =====================================================================
+with tab_blindaje:
+    col_bl1, col_bl2 = st.columns([3, 2])
+
+    with col_bl1:
+        st.subheader("⚔️ Simulador 'Abogado del Diablo' (Blindaje de Escritos)")
+        st.caption("Pon a prueba cualquier borrador antes de radicarlo: la IA actúa como el Juez estricto o el abogado de tu contraparte para detectar debilidades y entregarte una versión 100% blindada.")
+
+        fuente_borrador = st.radio(
+            "¿Qué texto deseas someter a blindaje?",
+            options=[
+                "Pegar mi propio borrador o texto manualmente",
+                "Usar el Memorial generado en la Pestaña 2 (Auditoría)",
+                "Usar el Escrito generado en la Pestaña 3 (Consultor)"
+            ],
+            horizontal=True
+        )
+
+        texto_inicial_blindaje = ""
+        if fuente_borrador.startswith("Usar el Memorial") and st.session_state.informe_md:
+            texto_inicial_blindaje = extraer_solo_borrador_radicable(st.session_state.informe_md) or st.session_state.informe_md
+        elif fuente_borrador.startswith("Usar el Escrito") and st.session_state.estrategia_md:
+            texto_inicial_blindaje = extraer_solo_borrador_radicable(st.session_state.estrategia_md) or st.session_state.estrategia_md
+
+        borrador_a_blindar = st.text_area(
+            "Escrito o memorial a auditar y blindar:",
+            value=texto_inicial_blindaje,
+            height=220,
+            placeholder="Pega aquí tu derecho de petición, demanda, queja, recurso o memorial para que el Abogado del Diablo busque huecos legales y lo reescriba blindado..."
+        )
+
+        if st.button("🛡️ Atacar Debilidades y Generar Escrito Blindado", type="primary", use_container_width=True):
+            if not api_key_input:
+                st.error("❌ Ingresa tu API Key en la barra lateral.")
+            elif not borrador_a_blindar or len(borrador_a_blindar.strip()) < 30:
+                st.warning("⚠️ Ingresa o selecciona un borrador válido para blindar.")
+            else:
+                client = obtener_cliente_gemini(api_key_input)
+                prompt_diablo = construir_prompt_abogado_diablo(
+                    borrador_usuario=borrador_a_blindar,
+                    tipo_proceso=tipo_proceso,
+                    entidad_especifica=entidad_especifica,
+                    datos_firmante=datos_firmante_dict
+                )
+                with st.spinner("⚔️ Simulando ataques de la contraparte y blindando tu documento..."):
+                    try:
+                        res_blindaje, mod_b = llamar_gemini(
+                            client=client,
+                            api_key=api_key_input,
+                            prompt_contents=prompt_diablo,
+                            modelo_preferido=modelo_sel,
+                            temperatura=0.1
+                        )
+                        st.session_state.blindaje_md = res_blindaje
+                        st.success(f"✅ Escrito blindado con éxito (`{mod_b}`).")
+                    except Exception as e:
+                        st.error(f"❌ Error en el blindaje: {str(e)}")
+
+    with col_bl2:
+        st.subheader("📅 Calculadora de Términos Hábiles (Colombia)")
+        st.caption("Descuenta automáticamente sábados, domingos y los 18 festivos oficiales de Colombia (Ley Emiliani y Semana Santa).")
+
+        termino_preset = st.selectbox(
+            "Tipo de Término Legal en Colombia:",
+            options=[
+                "Derecho de Petición General — 15 días hábiles (Art. 14 Ley 1755/2015)",
+                "Petición de Documentos y Copias — 10 días hábiles (Si no responden: Silencio Positivo)",
+                "Petición de Consulta — 30 días hábiles (Art. 14 Ley 1755/2015)",
+                "Reclamación Directa al Productor/Proveedor SIC — 15 días hábiles (Ley 1480/2011)",
+                "Ejecutoria / Recurso de Reposición contra Auto Judicial — 3 días hábiles (CGP)",
+                "Impugnación de Sentencia de Tutela — 3 días hábiles (Art. 31 Dto. 2591/1991)",
+                "Recurso de Reposición/Apelación Acto Administrativo — 10 días hábiles (Art. 76 CPACA)",
+                "Trámite de Incidente de Desacato — 10 días hábiles (Sentencia C-367/2014)",
+                "Contestación Demanda Civil Verbal / SIC — 20 días hábiles",
+                "Personalizado (Elegir número exacto de días hábiles)"
+            ]
+        )
+
+        mapa_dias = {
+            "15 días": 15,
+            "10 días": 10,
+            "30 días": 30,
+            "3 días": 3,
+            "20 días": 20
+        }
+        dias_defecto = 15
+        for clave_d, val_d in mapa_dias.items():
+            if clave_d in termino_preset:
+                dias_defecto = val_d
+                break
+
+        fecha_notif = st.date_input("Fecha de Radicación o Notificación Efectiva:", value=date.today())
+        dias_calcular = st.number_input("Días hábiles del término:", min_value=1, max_value=180, value=dias_defecto)
+
+        fecha_venc, fines_sem, festivos_cruzados, df_ruta_dias = sumar_dias_habiles_colombia(fecha_notif, int(dias_calcular))
+        dias_restantes_hoy = (fecha_venc - date.today()).days
+
+        st.markdown(f"""
+        <div class="gold-box">
+            <h4 style="margin:0 0 0.4rem 0;">📌 Fecha Exacta de Vencimiento: {fecha_venc.strftime('%d/%m/%Y')}</h4>
+            <p style="margin:0; font-size:0.9rem;">
+                • <b>Días calendario faltantes desde hoy:</b> {dias_restantes_hoy} día(s)<br>
+                • <b>Sábados y domingos descontados:</b> {fines_sem}<br>
+                • <b>Festivos de Colombia descontados ({len(festivos_cruzados)}):</b> {', '.join(festivos_cruzados) if festivos_cruzados else 'Ninguno en este rango'}
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        with st.expander("📆 Ver desglose día hábil por día hábil"):
+            st.dataframe(df_ruta_dias, use_container_width=True, height=210)
+
+    if st.session_state.blindaje_md:
+        st.divider()
+        c_bl_d1, c_bl_d2 = st.columns(2)
+        with c_bl_d1:
+            w_blindaje_full = convertir_markdown_a_docx_bytes(
+                st.session_state.blindaje_md,
+                titulo_portada="DICTAMEN DE BLINDAJE Y ESCRITO REFORZADO",
+                incluir_portada=True
+            )
+            st.download_button(
+                label="🛡️ Descargar Auditoría de Blindaje + Escrito (.docx)",
+                data=w_blindaje_full,
+                file_name=f"Blindaje_Completo_{datetime.now().strftime('%Y%m%d_%H%M')}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                type="primary",
+                use_container_width=True
+            )
+        with c_bl_d2:
+            solo_blindado = extraer_solo_borrador_radicable(st.session_state.blindaje_md)
+            if solo_blindado:
+                w_blindaje_clean = convertir_markdown_a_docx_bytes(
+                    solo_blindado,
+                    titulo_portada="",
+                    incluir_portada=False
+                )
+                st.download_button(
+                    label="⚖️ Descargar SOLO el Escrito Blindado Limpio (.docx)",
+                    data=w_blindaje_clean,
+                    file_name=f"Escrito_Blindado_Radicable_{datetime.now().strftime('%Y%m%d_%H%M')}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True
+                )
+        st.markdown(st.session_state.blindaje_md)
+
+# =====================================================================
+# PESTAÑA 5: SALA DE INTERROGATORIO AL EXPEDIENTE (CON BOTONES TÁCTICOS)
 # =====================================================================
 with tab_rag:
-    st.subheader("💬 Chat Jurídico Interactivo (Sobre tus PDFs o sobre Leyes Colombianas)")
-    st.caption("Haz preguntas puntuales sobre cualquier folio de los PDFs cargados o consulta dudas procesales adicionales.")
+    st.subheader("💬 Sala de Interrogatorio al Expediente y Consultas Rápidas")
+    st.caption("Usa los botones tácticos de un clic o escribe cualquier pregunta sobre tus PDFs o sobre procedimiento colombiano.")
+
+    q_col1, q_col2, q_col3, q_col4 = st.columns(4)
+    pregunta_rapida = None
+    if q_col1.button("🎯 Confesiones de la contraparte", use_container_width=True):
+        pregunta_rapida = "Busca en todos los documentos cargados qué admisiones, confesiones espontáneas o contradicciones ha cometido la contraparte o la entidad y dime en qué archivo y página exacta están."
+    if q_col2.button("⏳ ¿Hay plazos vencidos o silencio?", use_container_width=True):
+        pregunta_rapida = "Verifica todas las fechas del expediente y dime si se configuró vencimiento de términos judiciales, incumplimiento de plazos o silencio administrativo positivo/negativo según la ley colombiana."
+    if q_col3.button("🛡️ ¿Qué pruebas nos faltan?", use_container_width=True):
+        pregunta_rapida = "Dime con rigor de juez estricto qué vacíos probatorios tenemos hoy y qué pruebas documentales o por oficio debemos pedir o adjuntar de inmediato."
+    if q_col4.button("🎙️ Guion para audiencia / cita", use_container_width=True):
+        pregunta_rapida = "Prepárame un guion ejecutivo, contundente y ordenado de 5 puntos clave con citas de folios para exponer verbalmente este caso en una audiencia, inspección o reunión."
 
     for msj in st.session_state.historial_chat:
         with st.chat_message(msj["role"]):
             st.markdown(msj["content"])
 
-    pregunta_chat = st.chat_input("Escribe tu pregunta (ej. ¿Qué artículo de la Ley 1480 o del CGP aplica aquí, o en qué página está tal oficio?)...")
+    pregunta_manual = st.chat_input("Escribe tu pregunta sobre cualquier folio o ley colombiana...")
+    pregunta_activa = pregunta_rapida or pregunta_manual
 
-    if pregunta_chat:
+    if pregunta_activa:
         if not api_key_input:
             st.error("❌ Configura tu API Key en la barra lateral.")
         else:
-            st.session_state.historial_chat.append({"role": "user", "content": pregunta_chat})
+            st.session_state.historial_chat.append({"role": "user", "content": pregunta_activa})
             with st.chat_message("user"):
-                st.markdown(pregunta_chat)
+                st.markdown(pregunta_activa)
 
             with st.chat_message("assistant"):
-                with st.spinner("Analizando consulta jurídica..."):
+                with st.spinner("Consultando folios y normativa colombiana..."):
                     client = obtener_cliente_gemini(api_key_input)
                     if st.session_state.expediente_docs:
                         contexto_docs = "\n\n".join(
                             [f"=== DOCUMENTO: {d['nombre']} ===\n{d['raw'][:limite_chars]}" for d in st.session_state.expediente_docs]
                         )
                     else:
-                        contexto_docs = "Sin documentos subidos en esta sesión. Responde conforme a la legislación y jurisprudencia colombiana vigente."
+                        contexto_docs = "Sin documentos subidos en esta sesión. Responde conforme a la legislación colombiana vigente."
 
                     prompt_pregunta = f"""
-Actúa como abogado litigante colombiano experto.
+Actúa como abogado litigante colombiano senior.
 {MARCO_JURIDICO_COLOMBIA}
 
-Si la respuesta proviene de los documentos cargados, cita siempre `(Archivo: nombre.pdf, Pág. X)` y transcribe entre comillas el fragmento probatorio.
-Si es una consulta estratégica o legal sobre Colombia, cita las normas exactas (Leyes, Decretos, Códigos y Sentencias) y explica paso a paso qué hacer.
+Si la respuesta proviene de los documentos cargados, cita siempre `(Archivo: nombre.pdf, Pág. X)` (sin usar barras verticales) y transcribe entre comillas el fragmento probatorio.
+Si es una consulta legal sobre Colombia, cita las normas exactas (Leyes, Artículos y Sentencias) y explica paso a paso qué hacer.
 
 CONTEXTO DOCUMENTAL:
 {contexto_docs}
 
 PREGUNTA DEL USUARIO:
-{pregunta_chat}
+{pregunta_activa}
 """
                     try:
                         respuesta_chat, _ = llamar_gemini(
                             client=client,
+                            api_key=api_key_input,
                             prompt_contents=prompt_pregunta,
                             modelo_preferido=modelo_sel,
                             temperatura=0.1
@@ -1203,65 +1651,96 @@ PREGUNTA DEL USUARIO:
                         st.error(f"Error en la consulta: {str(e)}")
 
 # =====================================================================
-# PESTAÑA 5: CENTRO DE EXPORTACIÓN (WORD, EXCEL Y MARKDOWN)
+# PESTAÑA 6: BÓVEDA CENTRAL DE EXPORTACIÓN (WORD, ESCRITOS LIMPIOS Y EXCEL)
 # =====================================================================
 with tab_export:
-    st.subheader("📄 Centro de Descarga de Entregables Profesionales")
+    st.subheader("📄 Bóveda Central de Entregables Profesionales")
+    st.caption("Todos los archivos se compilan con caché inteligente (0% sobrecarga de CPU) y están listos para descargar.")
 
-    col_exp1, col_exp2, col_exp3 = st.columns(3)
+    col_e1, col_e2, col_e3, col_e4 = st.columns(4)
 
-    with col_exp1:
-        st.markdown("#### 📘 1. Auditoría de Expediente (`.docx`)")
-        st.write("Informe completo con tablas blindadas, matriz de contradicciones y memorial del expediente.")
+    with col_e1:
+        st.markdown("#### 📘 1. Auditoría Expediente")
+        st.write("Informe completo + Memorial separado listo para firmar.")
         if st.session_state.informe_md:
-            docx_file = convertir_markdown_a_docx_bytes(
-                st.session_state.informe_md,
-                titulo_portada="INFORME DE AUDITORÍA PROCESAL Y PLAN DE ACCIÓN"
-            )
             st.download_button(
-                label="⬇️ Descargar Auditoría en Word (.docx)",
-                data=docx_file,
-                file_name=f"01_INFORME_AUDITORIA_EXPEDIENTE_{datetime.now().strftime('%Y%m%d')}.docx",
+                label="⬇️ Informe Completo (.docx)",
+                data=convertir_markdown_a_docx_bytes(st.session_state.informe_md, "INFORME DE AUDITORÍA PROCESAL", True),
+                file_name=f"01_INFORME_AUDITORIA_{datetime.now().strftime('%Y%m%d')}.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 use_container_width=True,
                 type="primary"
             )
+            mem_limpio = extraer_solo_borrador_radicable(st.session_state.informe_md)
+            if mem_limpio:
+                st.download_button(
+                    label="⚖️ Solo Memorial Limpio (.docx)",
+                    data=convertir_markdown_a_docx_bytes(mem_limpio, "", False),
+                    file_name=f"01B_MEMORIAL_RADICABLE_{datetime.now().strftime('%Y%m%d')}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True
+                )
         else:
-            st.info("Genera primero la auditoría en la Pestaña 2.")
+            st.info("Disponible tras ejecutar la Pestaña 2.")
 
-    with col_exp2:
-        st.markdown("#### 🧭 2. Estrategia Desde Cero (`.docx`)")
-        st.write("Dictamen de la Caja de Herramientas con ruta legal paso a paso y borrador para actuaciones nuevas.")
+    with col_e2:
+        st.markdown("#### 🧭 2. Estrategia Desde Cero")
+        st.write("Concepto jurídico y escrito limpio para casos nuevos.")
         if st.session_state.estrategia_md:
-            docx_est = convertir_markdown_a_docx_bytes(
-                st.session_state.estrategia_md,
-                titulo_portada="CONCEPTO JURÍDICO ESTRATÉGICO Y BORRADOR DE ACTUACIÓN"
-            )
             st.download_button(
-                label="⬇️ Descargar Estrategia en Word (.docx)",
-                data=docx_est,
-                file_name=f"02_ESTRATEGIA_JURIDICA_COLOMBIA_{datetime.now().strftime('%Y%m%d')}.docx",
+                label="⬇️ Estrategia Completa (.docx)",
+                data=convertir_markdown_a_docx_bytes(st.session_state.estrategia_md, "ESTRATEGIA JURÍDICA COLOMBIA", True),
+                file_name=f"02_ESTRATEGIA_JURIDICA_{datetime.now().strftime('%Y%m%d')}.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 use_container_width=True,
                 type="primary"
             )
+            esc_limpio = extraer_solo_borrador_radicable(st.session_state.estrategia_md)
+            if esc_limpio:
+                st.download_button(
+                    label="⚖️ Solo Escrito Limpio (.docx)",
+                    data=convertir_markdown_a_docx_bytes(esc_limpio, "", False),
+                    file_name=f"02B_ESCRITO_RADICABLE_{datetime.now().strftime('%Y%m%d')}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True
+                )
         else:
-            st.info("Usa la Caja de Herramientas en la Pestaña 3 para habilitar esta descarga.")
+            st.info("Disponible tras usar la Pestaña 3.")
 
-    with col_exp3:
-        st.markdown("#### 📊 3. Matriz de Control en Excel (`.xlsx`)")
-        st.write("Libro Excel estilizado con Catálogo de Documentos (SHA-256) y Cronología de Actuaciones corregida.")
-        if not st.session_state.catalogo_df.empty:
-            excel_bytes = generar_excel_formateado_bytes(
-                st.session_state.catalogo_df,
-                st.session_state.actuaciones_df
-            )
+    with col_e3:
+        st.markdown("#### 🛡️ 3. Escrito Blindado")
+        st.write("Versión reforzada por el Simulador 'Abogado del Diablo'.")
+        if st.session_state.blindaje_md:
             st.download_button(
-                label="⬇️ Descargar Matriz en Excel (.xlsx)",
-                data=excel_bytes,
-                file_name=f"03_MATRIZ_CONTROL_EXPEDIENTE_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                label="⬇️ Blindaje Completo (.docx)",
+                data=convertir_markdown_a_docx_bytes(st.session_state.blindaje_md, "DICTAMEN DE BLINDAJE PROCESAL", True),
+                file_name=f"03_BLINDAJE_COMPLETO_{datetime.now().strftime('%Y%m%d')}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True,
+                type="primary"
+            )
+            bl_limpio = extraer_solo_borrador_radicable(st.session_state.blindaje_md)
+            if bl_limpio:
+                st.download_button(
+                    label="⚖️ Solo Escrito Blindado (.docx)",
+                    data=convertir_markdown_a_docx_bytes(bl_limpio, "", False),
+                    file_name=f"03B_ESCRITO_BLINDADO_{datetime.now().strftime('%Y%m%d')}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True
+                )
+        else:
+            st.info("Disponible tras usar la Pestaña 4.")
+
+    with col_e4:
+        st.markdown("#### 📊 4. Matriz en Excel")
+        st.write("Inventario SHA-256 y Cronología de Actuaciones.")
+        if not st.session_state.catalogo_df.empty:
+            st.download_button(
+                label="⬇️ Descargar Excel (.xlsx)",
+                data=generar_excel_formateado_bytes(st.session_state.catalogo_df, st.session_state.actuaciones_df),
+                file_name=f"04_MATRIZ_CONTROL_EXPEDIENTE_{datetime.now().strftime('%Y%m%d')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True
             )
         else:
-            st.info("Procesa documentos en la Pestaña 1 para habilitar el Excel.")
+            st.info("Disponible tras cargar PDFs en la Pestaña 1.")
