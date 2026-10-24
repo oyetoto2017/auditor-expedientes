@@ -407,7 +407,7 @@ def ocr_pagina_ligero(page, api_key: str, client=None, modo_ocr="Nube Gemini Vis
     if modo_ocr.startswith("Desactivado"):
         return "", "Omitido"
 
-    pix = page.get_pixmap(dpi=110, alpha=False)
+    pix = page.get_pixmap(dpi=120, alpha=False)
     img_bytes = pix.tobytes("jpeg")
     del pix
     img = Image.open(io.BytesIO(img_bytes))
@@ -504,7 +504,7 @@ def extraer_fechas_de_pagina(nombre_archivo: str, num_pag: int, txt_pag: str) ->
 def procesar_archivo_ligero(uploaded_file, api_key: str, client=None, modo_ocr="Nube Gemini Vision (0% CPU Local - Recomendado)"):
     file_bytes = uploaded_file.getvalue()
     hash_sha256 = hashlib.sha256(file_bytes).hexdigest()[:16]
-    clave_cache = f"{hash_sha256}_{modo_ocr}"
+    clave_cache = f"{hash_sha256}_{modo_ocr[:6]}"
 
     if clave_cache in st.session_state.cache_hashes:
         del file_bytes
@@ -516,7 +516,6 @@ def procesar_archivo_ligero(uploaded_file, api_key: str, client=None, modo_ocr="
     actuaciones_doc = []
     num_paginas = 0
     pags_ocr = 0
-    pags_sin_texto = 0
 
     try:
         if ext == ".pdf":
@@ -525,7 +524,7 @@ def procesar_archivo_ligero(uploaded_file, api_key: str, client=None, modo_ocr="
             for i in range(num_paginas):
                 page = doc[i]
                 num_pag = i + 1
-                txt = page.get_text("text", sort=True).strip()
+                txt = page.get_text("text").strip()
                 if len(txt) >= 35:
                     bloque = f"[Archivo: {nombre} - Pág. {num_pag}]\n{txt}"
                 else:
@@ -534,7 +533,6 @@ def procesar_archivo_ligero(uploaded_file, api_key: str, client=None, modo_ocr="
                         pags_ocr += 1
                         bloque = f"[Archivo: {nombre} - Pág. {num_pag} ({met_ocr})]\n{txt_ocr}"
                     else:
-                        pags_sin_texto += 1
                         bloque = f"[Archivo: {nombre} - Pág. {num_pag} (SIN TEXTO EXTRAÍDO)]"
                 bloques_texto.append(bloque)
                 actuaciones_doc.extend(extraer_fechas_de_pagina(nombre, num_pag, bloque))
@@ -578,7 +576,6 @@ def procesar_archivo_ligero(uploaded_file, api_key: str, client=None, modo_ocr="
         "hash": hash_sha256,
         "num_paginas": num_paginas,
         "pags_ocr": pags_ocr,
-        "pags_sin_texto": pags_sin_texto,
         "caracteres": len(texto_unificado),
         "meta": meta,
         "actuaciones": actuaciones_doc,
@@ -1066,14 +1063,13 @@ with st.sidebar:
     )
 
     modo_ocr_sel = st.selectbox(
-        "⚡ Lectura de PDF / OCR",
+        "⚡ Motor OCR (Anti-Bloqueo CPU)",
         options=[
-            "Desactivado (PDF digital - más rápido)",
+            "Nube Gemini Vision (0% CPU Local - Recomendado)",
             "Tesseract Local Ligero (120 DPI)",
-            "Nube Gemini Vision (OCR para PDF escaneado)"
+            "Desactivado (Solo PDFs Digitales - Ultra Rápido)"
         ],
-        index=0,
-        help="La lectura normal de PDF digital es rápida. El OCR de páginas escaneadas tarda más; actívalo solo cuando el PDF no tenga texto seleccionable."
+        index=0
     )
 
     st.divider()
@@ -1195,7 +1191,7 @@ tab_carga, tab_auditoria, tab_consultor, tab_blindaje, tab_rag, tab_export = st.
 # =====================================================================
 with tab_carga:
     st.subheader("📤 Cargar Documentos del Expediente, Demanda, Oficios o Pruebas")
-    st.caption("Los PDF digitales se leen directamente y rápido. Si un PDF está escaneado como imagen, selecciona Tesseract o Gemini Vision en la barra lateral para activar OCR; el OCR puede tardar más.")
+    st.caption("Optimizado para bajo consumo de RAM y CPU: puedes cargar decenas de PDFs sin desconectar el servidor.")
 
     archivos_subidos = st.file_uploader(
         "Arrastra aquí tus archivos (PDF, DOCX, TXT o RTF)",
@@ -1219,7 +1215,7 @@ with tab_carga:
             zona_progreso = st.empty()
 
             for idx, arch in enumerate(archivos_subidos):
-                zona_progreso.info(f"⏳ Leyendo documento {idx + 1}/{len(archivos_subidos)}: **{arch.name}**. Los PDF digitales suelen procesarse rápido; los escaneados requieren OCR.")
+                zona_progreso.info(f"⏳ Procesando documento {idx + 1} de {len(archivos_subidos)}: **{arch.name}**...")
                 item_doc = procesar_archivo_ligero(
                     arch,
                     api_key=api_key_input,
@@ -1238,7 +1234,6 @@ with tab_carga:
                     "Archivo": it["nombre"],
                     "Páginas": it["num_paginas"],
                     "Págs OCR": it["pags_ocr"],
-                    "Págs sin texto": it.get("pags_sin_texto", 0),
                     "Caracteres": it["caracteres"],
                     "Radicado Detectado": it["meta"]["radicado"],
                     "Actuaciones": ", ".join(it["meta"]["tipo_actuacion"][:4]) or "General",
@@ -1250,33 +1245,15 @@ with tab_carga:
             st.session_state.catalogo_df = pd.DataFrame(filas_cat)
             st.session_state.actuaciones_df = consolidar_cronologia_df(docs_procesados)
             actualizar_banner_estado()
-            total_sin_texto = sum(d.get("pags_sin_texto", 0) for d in docs_procesados)
-            total_ocr = sum(d.get("pags_ocr", 0) for d in docs_procesados)
-            st.success(
-                f"✅ Lectura terminada: {len(docs_procesados)} documentos, "
-                f"{sum(d['num_paginas'] for d in docs_procesados)} páginas y {total_ocr} páginas procesadas con OCR."
-            )
-            if total_sin_texto:
-                st.warning(
-                    f"⚠️ {total_sin_texto} página(s) no contienen texto extraíble. "
-                    "Si son páginas escaneadas, selecciona 'Tesseract Local Ligero' o "
-                    "'Nube Gemini Vision' en la barra lateral y vuelve a procesar los archivos."
-                )
-            st.info("Ahora puedes pasar a la Pestaña 2 para ejecutar la auditoría.")
+            st.success(f"✅ ¡Listo! {len(docs_procesados)} documentos indexados correctamente. Ahora pasa a la Pestaña 2 para ejecutar la auditoría.")
 
     if st.session_state.expediente_docs:
         docs_mem = st.session_state.expediente_docs
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("📁 Archivos en Bóveda", len(docs_mem))
         m2.metric("📄 Total Páginas / Folios", sum(d["num_paginas"] for d in docs_mem))
-        m3.metric("🔍 Folios Leídos con OCR", sum(d.get("pags_ocr", 0) for d in docs_mem))
+        m3.metric("🔍 Folios Leídos con OCR", sum(d["pags_ocr"] for d in docs_mem))
         m4.metric("📝 Caracteres Extraídos", f"{sum(d['caracteres'] for d in docs_mem):,}")
-        paginas_sin_texto_total = sum(d.get("pags_sin_texto", 0) for d in docs_mem)
-        if paginas_sin_texto_total:
-            st.warning(
-                f"Hay {paginas_sin_texto_total} página(s) sin texto extraíble. "
-                "Si contienen documentos escaneados, vuelve a procesar con OCR activado."
-            )
 
         st.markdown("#### 📋 Inventario Técnico del Expediente")
         st.dataframe(st.session_state.catalogo_df, use_container_width=True)
