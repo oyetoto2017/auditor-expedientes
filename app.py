@@ -15,38 +15,82 @@ from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from dateparser import parse
 from PIL import Image
-from openpyxl.styles import Font, PatternFill, Alignment
 from google import genai
 from google.genai import types
 
+try:
+    import streamlit.components.v1 as components
+except Exception:
+    components = None
+
+try:
+    from dateparser import parse as parse_fecha_es
+except Exception:
+    parse_fecha_es = None
+
+try:
+    from openpyxl.styles import Font, PatternFill, Alignment
+    ESTILOS_EXCEL_OK = True
+except Exception:
+    ESTILOS_EXCEL_OK = False
+
 # =====================================================================
-# CONFIGURACIÓN DE PÁGINA Y ESTILOS VISUALES EJECUTIVOS
+# CONFIGURACIÓN DE PÁGINA Y ESCUDO ANTI-TRADUCTOR (EVITA ERROR removeChild)
 # =====================================================================
 st.set_page_config(
-    page_title="Bufete Litigante IA Colombia | Auditoría, Estrategia y Blindaje",
+    page_title="Bufete Litigante IA Colombia | Auditoría y Estrategia",
     page_icon="⚖️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
+st.markdown('<meta name="google" content="notranslate">', unsafe_allow_html=True)
+if components is not None:
+    try:
+        components.html(
+            """
+            <script>
+                try {
+                    const doc = window.parent.document;
+                    doc.documentElement.setAttribute('lang', 'es');
+                    doc.documentElement.setAttribute('translate', 'no');
+                    doc.documentElement.classList.add('notranslate');
+                    if (doc.body) {
+                        doc.body.setAttribute('translate', 'no');
+                        doc.body.classList.add('notranslate');
+                    }
+                    if (!doc.querySelector('meta[name="google"]')) {
+                        const m = doc.createElement('meta');
+                        m.name = 'google';
+                        m.content = 'notranslate';
+                        doc.head.appendChild(m);
+                    }
+                } catch (e) {}
+            </script>
+            """,
+            height=0,
+            width=0
+        )
+    except Exception:
+        pass
+
 st.markdown("""
 <style>
     .main-header {
         background: linear-gradient(135deg, #0f172a 0%, #1e3a8a 65%, #1d4ed8 100%);
-        padding: 1.6rem 2rem;
+        padding: 1.5rem 2rem;
         border-radius: 12px;
         color: white;
         margin-bottom: 0.9rem;
         border-bottom: 4px solid #f59e0b;
-        box-shadow: 0 4px 15px rgba(15, 23, 42, 0.15);
+        box-shadow: 0 4px 14px rgba(15, 23, 42, 0.14);
     }
     .status-bar {
         display: flex;
         flex-wrap: wrap;
         gap: 0.65rem;
-        margin-bottom: 1.2rem;
+        margin-bottom: 1.1rem;
     }
     .status-pill {
         background-color: #f1f5f9;
@@ -71,7 +115,7 @@ st.markdown("""
         background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%);
         border: 1px solid #cbd5e1;
         border-left: 5px solid #1e3a8a;
-        padding: 1.2rem;
+        padding: 1.15rem;
         border-radius: 10px;
         margin-bottom: 1.1rem;
     }
@@ -79,7 +123,7 @@ st.markdown("""
         background-color: #fffbeb;
         border: 1px solid #fde68a;
         border-left: 5px solid #d97706;
-        padding: 1.1rem;
+        padding: 1.05rem;
         border-radius: 10px;
         color: #78350f;
         margin-bottom: 1rem;
@@ -95,21 +139,29 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =====================================================================
-# ESTADO DE SESIÓN Y BÓVEDA DE CACHÉ ANTI-BLOQUEO DE CPU
+# ESTADO DE SESIÓN ULTRA-LIGERO EN MEMORIA RAM (EVITA CAÍDAS 'Oh, no')
 # =====================================================================
-DEFAULTS_SESION = {
-    "expediente_docs": [],
-    "cache_archivos": {},
-    "actuaciones_df": pd.DataFrame(),
-    "catalogo_df": pd.DataFrame(),
-    "informe_md": "",
-    "estrategia_md": "",
-    "blindaje_md": "",
-    "historial_chat": []
-}
-for k_ses, v_def in DEFAULTS_SESION.items():
-    if k_ses not in st.session_state:
-        st.session_state[k_ses] = v_def
+def inicializar_sesion():
+    if "expediente_docs" not in st.session_state:
+        st.session_state.expediente_docs = []
+    if "cache_hashes" not in st.session_state:
+        st.session_state.cache_hashes = {}
+    if "actuaciones_df" not in st.session_state:
+        st.session_state.actuaciones_df = pd.DataFrame()
+    if "catalogo_df" not in st.session_state:
+        st.session_state.catalogo_df = pd.DataFrame()
+    if "informe_md" not in st.session_state:
+        st.session_state.informe_md = ""
+    if "estrategia_md" not in st.session_state:
+        st.session_state.estrategia_md = ""
+    if "blindaje_md" not in st.session_state:
+        st.session_state.blindaje_md = ""
+    if "historial_chat" not in st.session_state:
+        st.session_state.historial_chat = []
+    if "modelos_cache" not in st.session_state:
+        st.session_state.modelos_cache = {}
+
+inicializar_sesion()
 
 def obtener_api_key_inicial():
     try:
@@ -119,8 +171,20 @@ def obtener_api_key_inicial():
         pass
     return os.environ.get("GOOGLE_API_KEY", "").strip()
 
+def df_a_markdown_seguro(df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return "Sin registros detectados."
+    cols = [str(c) for c in df.columns]
+    header = "| " + " | ".join(cols) + " |"
+    sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+    filas = [header, sep]
+    for _, row in df.iterrows():
+        celdas = [re.sub(r'\s+', ' ', str(row[c]).replace("|", "-")).strip() for c in df.columns]
+        filas.append("| " + " | ".join(celdas) + " |")
+    return "\n".join(filas)
+
 # =====================================================================
-# EXPRESIONES REGULARES CORREGIDAS PARA METADATOS Y FECHAS
+# EXPRESIONES REGULARES PARA METADATOS Y FECHAS
 # =====================================================================
 RE_FECHA = re.compile(r'\b\d{1,2}[\/\-]\d{1,2}[\/\-](?:\d{4}|\d{2})\b')
 RE_RADICADO = re.compile(
@@ -177,7 +241,6 @@ def trasladar_a_lunes(d: date) -> date:
         return d
     return d + timedelta(days=(7 - d.weekday()))
 
-@st.cache_data(show_spinner=False)
 def obtener_festivos_colombia(year: int) -> set:
     fijos = [
         date(year, 1, 1),
@@ -228,7 +291,7 @@ def sumar_dias_habiles_colombia(fecha_inicio: date, dias_habiles: int):
     return actual, fines_semana_omitidos, festivos_omitidos, pd.DataFrame(ruta_dias)
 
 # =====================================================================
-# CLIENTE GEMINI CON CACHÉ DE MODELOS (CERO CONSUMO REPETIDO DE RED/CPU)
+# CLIENTE GEMINI CON AUTO-DETECCIÓN LIGERA EN SESIÓN
 # =====================================================================
 MODELOS_RESPALDO = [
     "gemini-3-flash-preview",
@@ -252,12 +315,13 @@ def obtener_cliente_gemini(api_key: str):
         return None
     return genai.Client(api_key=api_key.strip())
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def descubrir_modelos_activos_cached(key_fingerprint: str, _api_key: str):
-    """Guarda en caché por 1 hora los modelos disponibles para no consultar en cada llamada."""
+def obtener_cola_modelos(client, api_key: str):
+    key_fp = hashlib.sha256(api_key.strip().encode("utf-8")).hexdigest()[:12]
+    if key_fp in st.session_state.modelos_cache:
+        return list(st.session_state.modelos_cache[key_fp])
+
     modelos_cuenta = []
     try:
-        client = genai.Client(api_key=_api_key.strip())
         for m in client.models.list():
             nombre = getattr(m, "name", "")
             if not nombre:
@@ -294,12 +358,13 @@ def descubrir_modelos_activos_cached(key_fingerprint: str, _api_key: str):
             score += 15
         return -score
 
-    modelos_ordenados = sorted(list(dict.fromkeys(modelos_cuenta)), key=puntaje_modelo)
-    return modelos_ordenados + [m for m in MODELOS_RESPALDO if m not in modelos_ordenados]
+    ordenados = sorted(list(dict.fromkeys(modelos_cuenta)), key=puntaje_modelo)
+    cola = ordenados + [m for m in MODELOS_RESPALDO if m not in ordenados]
+    st.session_state.modelos_cache[key_fp] = cola
+    return list(cola)
 
 def llamar_gemini(client, api_key: str, prompt_contents, modelo_preferido="Auto-Detectar (Recomendado)", temperatura=0.1, max_reintentos=2):
-    key_fp = hashlib.sha256(api_key.strip().encode("utf-8")).hexdigest()[:12]
-    cola_modelos = list(descubrir_modelos_activos_cached(key_fp, api_key))
+    cola_modelos = obtener_cola_modelos(client, api_key)
     if modelo_preferido and modelo_preferido != "Auto-Detectar (Recomendado)":
         cola_modelos = [modelo_preferido] + [m for m in cola_modelos if m != modelo_preferido]
 
@@ -329,24 +394,24 @@ def llamar_gemini(client, api_key: str, prompt_contents, modelo_preferido="Auto-
     raise RuntimeError("No fue posible obtener respuesta. Últimos intentos: " + " | ".join(errores[-4:]))
 
 # =====================================================================
-# MOTOR OCR ANTI-BLOQUEO DE CPU (CLOUD-FIRST + 130 DPI + LIBERACIÓN RAM)
+# LECTURA ULTRA-LIGERA EN RAM Y AHORRO DE CPU
 # =====================================================================
-def ocr_pagina_optimizado(page, api_key: str, client=None, modo_ocr="Nube Gemini Vision (0% CPU Local - Recomendado)"):
-    """
-    Evita que Streamlit limite la CPU por exceso de carga:
-    1. Si modo_ocr es 'Desactivado', omite imágenes pesadas.
-    2. Renderiza a 130 DPI (57.8% menos carga que 200 DPI manteniendo legibilidad total).
-    3. Prioriza Gemini Vision en la nube (0% uso de CPU de Streamlit) cuando hay API Key.
-    """
-    if modo_ocr.startswith("Desactivado"):
-        return "", "Omitido-AhorroCPU"
+PATRON_BLOQUE_FECHA = re.compile(
+    r'(?m)^(?P<fecha>\d{1,2}[\/\-]\d{1,2}[\/\-](?:\d{4}|\d{2}))[ \t]*(?:[-–:][ \t]*)?(?P<encabezado>[\w\t \(\)\.,#º°\-]{8,110})$'
+)
+PATRON_ACTO_FECHA = re.compile(
+    r'(?i)(auto|providencia|resoluci[oó]n|sentencia|acta|oficio|notificaci[oó]n|audiencia|memorial|radicado|queja|recurso|orden|f[oó]rmula)[ \t]+(?:no\.?|n[o°]?)?[ \t]*[\w\-]*[ \t]*(?:del|de fecha|:)?[ \t]*(?P<fecha>\d{1,2}[\/\-]\d{1,2}[\/\-](?:\d{4}|\d{2}))'
+)
 
-    pix = page.get_pixmap(dpi=130, alpha=False)
+def ocr_pagina_ligero(page, api_key: str, client=None, modo_ocr="Nube Gemini Vision (0% CPU Local - Recomendado)"):
+    if modo_ocr.startswith("Desactivado"):
+        return "", "Omitido"
+
+    pix = page.get_pixmap(dpi=120, alpha=False)
     img_bytes = pix.tobytes("jpeg")
     del pix
     img = Image.open(io.BytesIO(img_bytes))
 
-    # Opción 1 (Recomendada): Nube de Google procesa el OCR -> 0% impacto en CPU de Streamlit
     if modo_ocr.startswith("Nube") and client is not None and api_key:
         try:
             texto_ia, _ = llamar_gemini(
@@ -360,18 +425,19 @@ def ocr_pagina_optimizado(page, api_key: str, client=None, modo_ocr="Nube Gemini
                 max_reintentos=1
             )
             img.close()
+            del img_bytes
             if texto_ia:
                 return texto_ia.strip(), "OCR-GeminiCloud"
         except Exception:
             pass
 
-    # Opción 2 / Respaldo: Tesseract local a baja resolución (130 DPI) para no saturar CPU
     try:
         import pytesseract
         texto_ocr = pytesseract.image_to_string(img, lang="spa").strip()
         img.close()
+        del img_bytes
         if len(texto_ocr) > 20:
-            return texto_ocr, "OCR-TesseractLigero"
+            return texto_ocr, "OCR-Tesseract"
     except Exception:
         try:
             img.close()
@@ -381,12 +447,11 @@ def ocr_pagina_optimizado(page, api_key: str, client=None, modo_ocr="Nube Gemini
     return "", "SIN_TEXTO"
 
 def limpiar_linea_meta(txt: str, max_len=110):
-    limpio = re.sub(r'\s+', ' ', str(txt)).strip()
-    return limpio[:max_len]
+    return re.sub(r'\s+', ' ', str(txt)).strip()[:max_len]
 
 def extraer_metadatos_documento(texto: str):
+    muestra = texto[:60000]
     meta = {
-        'fechas': [],
         'radicado': 'No identificado',
         'actor': 'No identificado',
         'demandado': 'No identificado',
@@ -394,84 +459,83 @@ def extraer_metadatos_documento(texto: str):
         'tipo_actuacion': [],
         'numero_oficio': 'No identificado'
     }
-    meta['fechas'] = list(dict.fromkeys(RE_FECHA.findall(texto)))[:15]
-
-    rr = RE_RADICADO.search(texto)
+    rr = RE_RADICADO.search(muestra)
     if rr:
         meta['radicado'] = limpiar_linea_meta(rr.group(0), 70)
-
-    no_of = RE_NUMERO_OFICIO.search(texto)
+    no_of = RE_NUMERO_OFICIO.search(muestra)
     if no_of:
         meta['numero_oficio'] = limpiar_linea_meta(no_of.group(0), 60)
-
-    da = RE_ACTOR.search(texto)
+    da = RE_ACTOR.search(muestra)
     if da:
         meta['actor'] = limpiar_linea_meta(da.group(2), 110)
-
-    dd = RE_DEMANDADO.search(texto)
+    dd = RE_DEMANDADO.search(muestra)
     if dd:
         meta['demandado'] = limpiar_linea_meta(dd.group(2), 110)
-
-    jj = RE_JUEZ.search(texto)
+    jj = RE_JUEZ.search(muestra)
     if jj:
         meta['juez'] = limpiar_linea_meta(jj.group(0), 110)
 
-    texto_upper = texto.upper()
+    texto_upper = muestra.upper()
     for tipo in TIPOS_ACT:
         if tipo in texto_upper:
             meta['tipo_actuacion'].append(tipo)
-
     return meta
 
-def procesar_archivo_subido(uploaded_file, api_key: str, client=None, modo_ocr="Nube Gemini Vision (0% CPU Local - Recomendado)"):
-    """
-    Lee el archivo una sola vez y lo guarda en caché por su huella SHA-256.
-    Si el usuario sube archivos adicionales después, los anteriores consumen 0% de CPU.
-    """
+def extraer_fechas_de_pagina(nombre_archivo: str, num_pag: int, txt_pag: str) -> list:
+    hallazgos = []
+    for m in PATRON_BLOQUE_FECHA.finditer(txt_pag):
+        hallazgos.append({
+            "Archivo": nombre_archivo,
+            "Página": num_pag,
+            "Fecha Literal": m.group("fecha").strip(),
+            "Actuación / Referencia": re.sub(r'\s+', ' ', m.group("encabezado")).strip(),
+            "Contexto": re.sub(r'\s+', ' ', txt_pag[max(0, m.start() - 25):min(len(txt_pag), m.end() + 120)]).strip()
+        })
+    for m in PATRON_ACTO_FECHA.finditer(txt_pag):
+        hallazgos.append({
+            "Archivo": nombre_archivo,
+            "Página": num_pag,
+            "Fecha Literal": m.group("fecha").strip(),
+            "Actuación / Referencia": re.sub(r'\s+', ' ', m.group(0)).strip(),
+            "Contexto": re.sub(r'\s+', ' ', txt_pag[max(0, m.start() - 25):min(len(txt_pag), m.end() + 120)]).strip()
+        })
+    return hallazgos
+
+def procesar_archivo_ligero(uploaded_file, api_key: str, client=None, modo_ocr="Nube Gemini Vision (0% CPU Local - Recomendado)"):
     file_bytes = uploaded_file.getvalue()
     hash_sha256 = hashlib.sha256(file_bytes).hexdigest()[:16]
+    clave_cache = f"{hash_sha256}_{modo_ocr[:6]}"
 
-    clave_cache = f"{hash_sha256}_{modo_ocr[:8]}"
-    if clave_cache in st.session_state.cache_archivos:
-        return st.session_state.cache_archivos[clave_cache]
+    if clave_cache in st.session_state.cache_hashes:
+        del file_bytes
+        return st.session_state.cache_hashes[clave_cache]
 
     nombre = uploaded_file.name
     ext = Path(nombre).suffix.lower()
-
-    paginas_estructuradas = []
-    paginas_ocr = []
-    paginas_vacias = []
+    bloques_texto = []
+    actuaciones_doc = []
+    num_paginas = 0
+    pags_ocr = 0
 
     try:
         if ext == ".pdf":
             doc = fitz.open(stream=file_bytes, filetype="pdf")
-            for i in range(len(doc)):
+            num_paginas = len(doc)
+            for i in range(num_paginas):
                 page = doc[i]
                 num_pag = i + 1
                 txt = page.get_text("text").strip()
-
                 if len(txt) >= 35:
-                    paginas_estructuradas.append({
-                        "pagina": num_pag,
-                        "origen": "Digital",
-                        "texto": f"[Archivo: {nombre} - Pág. {num_pag}]\n{txt}"
-                    })
+                    bloque = f"[Archivo: {nombre} - Pág. {num_pag}]\n{txt}"
                 else:
-                    txt_ocr, metodo_ocr = ocr_pagina_optimizado(page, api_key=api_key, client=client, modo_ocr=modo_ocr)
+                    txt_ocr, met_ocr = ocr_pagina_ligero(page, api_key=api_key, client=client, modo_ocr=modo_ocr)
                     if txt_ocr:
-                        paginas_ocr.append(num_pag)
-                        paginas_estructuradas.append({
-                            "pagina": num_pag,
-                            "origen": metodo_ocr,
-                            "texto": f"[Archivo: {nombre} - Pág. {num_pag} ({metodo_ocr})]\n{txt_ocr}"
-                        })
+                        pags_ocr += 1
+                        bloque = f"[Archivo: {nombre} - Pág. {num_pag} ({met_ocr})]\n{txt_ocr}"
                     else:
-                        paginas_vacias.append(num_pag)
-                        paginas_estructuradas.append({
-                            "pagina": num_pag,
-                            "origen": metodo_ocr,
-                            "texto": f"[Archivo: {nombre} - Pág. {num_pag} (SIN TEXTO EXTRAÍDO)]"
-                        })
+                        bloque = f"[Archivo: {nombre} - Pág. {num_pag} (SIN TEXTO EXTRAÍDO)]"
+                bloques_texto.append(bloque)
+                actuaciones_doc.extend(extraer_fechas_de_pagina(nombre, num_pag, bloque))
             doc.close()
 
         elif ext == ".docx":
@@ -482,108 +546,81 @@ def procesar_archivo_subido(uploaded_file, api_key: str, client=None, modo_ocr="
                     celdas = [c.text.strip().replace("\n", " ") for c in row.cells]
                     if any(celdas):
                         parrafos.append(" - ".join(celdas))
-
-            texto_completo_docx = "\n".join(parrafos)
+            texto_docx = "\n".join(parrafos)
             tam_pag = 3000
-            for idx_b, inicio in enumerate(range(0, max(1, len(texto_completo_docx)), tam_pag)):
-                fragmento = texto_completo_docx[inicio:inicio + tam_pag]
-                paginas_estructuradas.append({
-                    "pagina": idx_b + 1,
-                    "origen": "Word Nativo",
-                    "texto": f"[Archivo: {nombre} - Sección {idx_b + 1}]\n{fragmento}"
-                })
+            secciones = [texto_docx[k:k + tam_pag] for k in range(0, max(1, len(texto_docx)), tam_pag)]
+            num_paginas = len(secciones)
+            for idx_s, frag in enumerate(secciones, 1):
+                bloque = f"[Archivo: {nombre} - Sección {idx_s}]\n{frag}"
+                bloques_texto.append(bloque)
+                actuaciones_doc.extend(extraer_fechas_de_pagina(nombre, idx_s, bloque))
 
         elif ext in (".txt", ".rtf"):
             contenido = file_bytes.decode("utf-8", errors="ignore").strip()
-            paginas_estructuradas.append({
-                "pagina": 1,
-                "origen": "Texto Plano",
-                "texto": f"[Archivo: {nombre} - Pág. 1]\n{contenido}"
-            })
+            num_paginas = 1
+            bloque = f"[Archivo: {nombre} - Pág. 1]\n{contenido}"
+            bloques_texto.append(bloque)
+            actuaciones_doc.extend(extraer_fechas_de_pagina(nombre, 1, bloque))
 
     except Exception as e:
-        paginas_estructuradas.append({
-            "pagina": 1,
-            "origen": "Error",
-            "texto": f"[Archivo: {nombre} - ERROR DE EXTRACCIÓN: {str(e)}]"
-        })
+        num_paginas = 1
+        bloques_texto.append(f"[Archivo: {nombre} - ERROR DE LECTURA: {str(e)}]")
 
-    texto_unificado = "\n\n".join([p["texto"] for p in paginas_estructuradas])
+    del file_bytes
+    texto_unificado = "\n\n".join(bloques_texto)
+    del bloques_texto
     meta = extraer_metadatos_documento(texto_unificado)
 
-    resultado = {
+    item = {
         "nombre": nombre,
         "hash": hash_sha256,
-        "num_paginas": len(paginas_estructuradas),
+        "num_paginas": num_paginas,
+        "pags_ocr": pags_ocr,
         "caracteres": len(texto_unificado),
-        "paginas_ocr": paginas_ocr,
-        "paginas_vacias": paginas_vacias,
         "meta": meta,
-        "paginas": paginas_estructuradas,
+        "actuaciones": actuaciones_doc,
         "raw": texto_unificado
     }
-    st.session_state.cache_archivos[clave_cache] = resultado
-    return resultado
 
-def extraer_linea_tiempo_regex(items):
-    patron_bloque = re.compile(
-        r'(?m)^(?P<fecha>\d{1,2}[\/\-]\d{1,2}[\/\-](?:\d{4}|\d{2}))[ \t]*(?:[-–:][ \t]*)?(?P<encabezado>[\w\t \(\)\.,#º°\-]{8,110})$'
-    )
-    patron_acto = re.compile(
-        r'(?i)(auto|providencia|resoluci[oó]n|sentencia|acta|oficio|notificaci[oó]n|audiencia|memorial|radicado|queja|recurso|orden|f[oó]rmula)[ \t]+(?:no\.?|n[o°]?)?[ \t]*[\w\-]*[ \t]*(?:del|de fecha|:)?[ \t]*(?P<fecha>\d{1,2}[\/\-]\d{1,2}[\/\-](?:\d{4}|\d{2}))'
-    )
+    if len(st.session_state.cache_hashes) >= 35:
+        st.session_state.cache_hashes.clear()
+    st.session_state.cache_hashes[clave_cache] = item
+    return item
 
-    actuaciones = []
+def consolidar_cronologia_df(items: list) -> pd.DataFrame:
+    todas = []
     for it in items:
-        for pag in it["paginas"]:
-            txt = pag["texto"]
-            num_pag = pag["pagina"]
-
-            for m in patron_bloque.finditer(txt):
-                enc_limpio = re.sub(r'\s+', ' ', m.group("encabezado")).strip()
-                ctx_limpio = re.sub(r'\s+', ' ', txt[max(0, m.start() - 30):min(len(txt), m.end() + 140)]).strip()
-                actuaciones.append({
-                    "Archivo": it["nombre"],
-                    "Página": num_pag,
-                    "Fecha Literal": m.group("fecha").strip(),
-                    "Actuación / Referencia": enc_limpio,
-                    "Contexto": ctx_limpio
-                })
-
-            for m in patron_acto.finditer(txt):
-                enc_limpio = re.sub(r'\s+', ' ', m.group(0)).strip()
-                ctx_limpio = re.sub(r'\s+', ' ', txt[max(0, m.start() - 30):min(len(txt), m.end() + 140)]).strip()
-                actuaciones.append({
-                    "Archivo": it["nombre"],
-                    "Página": num_pag,
-                    "Fecha Literal": m.group("fecha").strip(),
-                    "Actuación / Referencia": enc_limpio,
-                    "Contexto": ctx_limpio
-                })
-
-    if not actuaciones:
+        todas.extend(it.get("actuaciones", []))
+    if not todas:
         return pd.DataFrame(columns=["Fecha ISO", "Fecha Literal", "Archivo", "Página", "Actuación / Referencia", "Contexto"])
 
     def normalizar_fecha(f_str):
-        try:
-            d = parse(str(f_str), languages=["es"], settings={"DATE_ORDER": "DMY"})
-            if d and 1990 <= d.year <= 2035:
-                return d.date().isoformat()
-        except Exception:
-            pass
+        texto_f = str(f_str).strip()
+        if parse_fecha_es is not None:
+            try:
+                d = parse_fecha_es(texto_f, languages=["es"], settings={"DATE_ORDER": "DMY"})
+                if d and 1990 <= d.year <= 2035:
+                    return d.date().isoformat()
+            except Exception:
+                pass
+        for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y", "%d-%m-%y"):
+            try:
+                d = datetime.strptime(texto_f, fmt).date()
+                if 1990 <= d.year <= 2035:
+                    return d.isoformat()
+            except Exception:
+                pass
         return "9999-12-31"
 
-    df_act = pd.DataFrame(actuaciones)
+    df_act = pd.DataFrame(todas)
     df_act["Fecha ISO"] = df_act["Fecha Literal"].apply(normalizar_fecha)
     df_act = df_act.drop_duplicates(subset=["Archivo", "Página", "Fecha Literal", "Actuación / Referencia"])
     df_act = df_act.sort_values(by=["Fecha ISO", "Archivo", "Página"]).reset_index(drop=True)
     df_act["Fecha ISO"] = df_act["Fecha ISO"].replace("9999-12-31", "Sin Fecha Exacta")
-
-    columnas_orden = ["Fecha ISO", "Fecha Literal", "Archivo", "Página", "Actuación / Referencia", "Contexto"]
-    return df_act[columnas_orden]
+    return df_act[["Fecha ISO", "Fecha Literal", "Archivo", "Página", "Actuación / Referencia", "Contexto"]]
 
 # =====================================================================
-# GENERADOR CACHEADO DE WORD (.DOCX) Y EXCEL (.XLSX) + EXTRACTOR DE MEMORIAL LIMPIO
+# GENERADOR DE WORD (.DOCX) Y EXCEL (.XLSX) BAJO DEMANDA
 # =====================================================================
 def aplicar_color_celda(cell, hex_color):
     shading_elm = OxmlElement('w:shd')
@@ -632,11 +669,10 @@ def volcar_tabla_en_word(doc, filas_tabla):
             fila_ajustada = fila + [""] * (num_cols - len(fila))
 
         for c_idx in range(num_cols):
-            texto_celda = fila_ajustada[c_idx]
             celda = tabla.cell(r_idx, c_idx)
             celda.text = ""
             p = celda.paragraphs[0]
-            agregar_texto_con_negrillas(p, texto_celda)
+            agregar_texto_con_negrillas(p, fila_ajustada[c_idx])
 
             if r_idx == 0:
                 aplicar_color_celda(celda, "1E3A8A")
@@ -653,10 +689,6 @@ def volcar_tabla_en_word(doc, filas_tabla):
     doc.add_paragraph()
 
 def extraer_solo_borrador_radicable(md_texto: str) -> str:
-    """
-    Extrae únicamente el texto del Memorial / Demanda / Petición / Queja (Sección 10 o Sección 7)
-    para que el usuario pueda descargar un Word 100% limpio listo para firmar y radicar.
-    """
     patron_inicio = re.compile(r'(?im)^##\s*(?:10|7)\.\s*BORRADOR.*$')
     m_ini = patron_inicio.search(md_texto)
     if not m_ini:
@@ -668,9 +700,7 @@ def extraer_solo_borrador_radicable(md_texto: str) -> str:
         resto = resto[:m_fin.start()].strip()
     return resto
 
-@st.cache_data(max_entries=12, show_spinner=False)
 def convertir_markdown_a_docx_bytes(md_texto: str, titulo_portada="INFORME JURÍDICO Y PLAN DE ACCIÓN PROCESAL", incluir_portada=True) -> bytes:
-    """Cacheado en memoria para no volver a consumir CPU en cada clic de Streamlit."""
     doc = Document()
 
     for section in doc.sections:
@@ -682,7 +712,6 @@ def convertir_markdown_a_docx_bytes(md_texto: str, titulo_portada="INFORME JURÍ
     if incluir_portada:
         titulo = doc.add_heading(titulo_portada, level=0)
         titulo.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
         sub = doc.add_paragraph()
         sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run_sub = sub.add_run(f"Generado el {datetime.now().strftime('%d/%m/%Y a las %H:%M')} | Bufete Litigante IA Colombia")
@@ -702,8 +731,7 @@ def convertir_markdown_a_docx_bytes(md_texto: str, titulo_portada="INFORME JURÍ
             contenido_sin_barras = linea_limpia.replace('|', '').replace('-', '').replace(':', '').strip()
             if not contenido_sin_barras:
                 continue
-            celdas = dividir_fila_markdown_segura(linea_limpia)
-            buffer_tabla.append(celdas)
+            buffer_tabla.append(dividir_fila_markdown_segura(linea_limpia))
             continue
         else:
             if buffer_tabla:
@@ -745,31 +773,28 @@ def convertir_markdown_a_docx_bytes(md_texto: str, titulo_portada="INFORME JURÍ
     doc.save(buffer_word)
     return buffer_word.getvalue()
 
-@st.cache_data(max_entries=6, show_spinner=False)
 def generar_excel_formateado_bytes(catalogo_df: pd.DataFrame, actuaciones_df: pd.DataFrame) -> bytes:
     buffer_excel = io.BytesIO()
     with pd.ExcelWriter(buffer_excel, engine="openpyxl") as writer:
         catalogo_df.to_excel(writer, sheet_name="01_Catalogo_Documentos", index=False)
         actuaciones_df.to_excel(writer, sheet_name="02_Cronologia_Actuaciones", index=False)
 
-        wb = writer.book
-        header_fill = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
-        header_font = Font(color="FFFFFF", bold=True, size=10)
-
-        for sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            ws.freeze_panes = "A2"
-            for cell in ws[1]:
-                cell.fill = header_fill
-                cell.font = header_font
-                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-            for col in ws.columns:
-                max_len = max((len(str(c.value or "")) for c in col), default=12)
-                col_letter = col[0].column_letter
-                ws.column_dimensions[col_letter].width = min(max(max_len + 3, 14), 55)
-                for cell in col[1:]:
-                    cell.alignment = Alignment(vertical="top", wrap_text=True)
+        if ESTILOS_EXCEL_OK:
+            wb = writer.book
+            header_fill = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
+            header_font = Font(color="FFFFFF", bold=True, size=10)
+            for sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+                ws.freeze_panes = "A2"
+                for cell in ws[1]:
+                    cell.fill = header_fill
+                    cell.font = header_font
+                    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                for col in ws.columns:
+                    max_len = max((len(str(c.value or "")) for c in col), default=12)
+                    ws.column_dimensions[col[0].column_letter].width = min(max(max_len + 3, 14), 55)
+                    for cell in col[1:]:
+                        cell.alignment = Alignment(vertical="top", wrap_text=True)
 
     return buffer_excel.getvalue()
 
@@ -779,7 +804,7 @@ def generar_excel_formateado_bytes(catalogo_df: pd.DataFrame, actuaciones_df: pd
 MARCO_JURIDICO_COLOMBIA = """
 DOMINIO NORMATIVO Y PROCESAL COLOMBIANO OBLIGATORIO SEGÚN LA ENTIDAD:
 - Constitucional y Salud: Constitución Política (Arts. 11, 23, 29, 49, 86), Decreto 2591 de 1991 (Tutela, Medida Provisional Art. 7, Impugnación Art. 31, Cumplimiento Art. 27 y Desacato Art. 52), Ley Estatutaria 1751 de 2015, Sentencias SU-034 de 2018 y T-760 de 2008.
-- Derecho de Petición y Procedimiento Administrativo: Ley 1755 de 2015 (15 días hábiles petición general, 10 días documentos/información, 30 días consultas; reserva legal e insistencia) y CPACA (Ley 1437 de 2011 modificada por Ley 2080 de 2021).
+- Derecho de Petición y Procedimiento Administrativo: Ley 1755 de 2015 (15 días hábiles petición general, 10 días documentos/información, 30 días consultas) y CPACA (Ley 1437 de 2011 modificada por Ley 2080 de 2021).
 - Protección al Consumidor, Constructoras e Inmobiliarias (SIC): Ley 1480 de 2011 (Estatuto del Consumidor: publicidad engañosa Arts. 29 y 30, efectividad de la garantía inmobiliaria y de bienes Arts. 7 a 16, información mínima Art. 23, cláusulas abusivas Arts. 42 y 43, acción jurisdiccional Art. 58), Circular Única de la SIC.
 - Control Disciplinario, Urbano y Ministerio Público (Procuraduría, Personerías, Alcaldías): Ley 1952 de 2019 y Ley 2094 de 2021 (Código General Disciplinario), Ley 388 de 1997 y Decreto 1077 de 2015 (Ordenamiento Territorial, licencias urbanísticas, entregas de zonas de cesión y espacio público), Ley 1801 de 2016 (Código Nacional de Seguridad y Convivencia Ciudadana - Querellas Policivas), Ley 142 de 1994 (Servicios Públicos Domiciliarios y silencio administrativo positivo).
 - Procesal Civil, Comercial y Propiedad Horizontal: Ley 1564 de 2012 (Código General del Proceso - CGP), Ley 2213 de 2022 (Justicia Digital y traslado previo de escritos), Código Civil, Código de Comercio, Ley 675 de 2001.
@@ -811,10 +836,10 @@ def construir_prompt_auditoria(
 ):
     total_docs = len(items)
     total_pags = sum(it["num_paginas"] for it in items)
-    total_ocr = sum(len(it["paginas_ocr"]) for it in items)
+    total_ocr = sum(it["pags_ocr"] for it in items)
 
-    catalogo_md = catalogo_df.to_markdown(index=False) if not catalogo_df.empty else "Sin catálogo"
-    actos_md = actuaciones_df.head(80).to_markdown(index=False) if not actuaciones_df.empty else "Sin actuaciones previas"
+    catalogo_md = df_a_markdown_seguro(catalogo_df)
+    actos_md = df_a_markdown_seguro(actuaciones_df.head(80))
 
     bloques_documentales = []
     for idx, it in enumerate(items, 1):
@@ -833,7 +858,7 @@ def construir_prompt_auditoria(
 =====================================================================
 DOCUMENTO #{idx}: {it['nombre']}{nota_recorte}
 - Hash SHA-256: {it['hash']}
-- Páginas totales: {it['num_paginas']} (Páginas con OCR: {len(it['paginas_ocr'])})
+- Páginas totales: {it['num_paginas']} (Páginas con OCR: {it['pags_ocr']})
 - Radicado detectado: {it['meta']['radicado']}
 - Tipo de actuación: {', '.join(it['meta']['tipo_actuacion']) or 'General'}
 - Actor / Solicitante: {it['meta']['actor']}
@@ -845,7 +870,7 @@ DOCUMENTO #{idx}: {it['nombre']}{nota_recorte}
 
     expediente_completo_str = "\n\n".join(bloques_documentales)
 
-    prompt = f"""
+    return f"""
 Actúa como un **Abogado Litigante Senior, Auditor Forense de Expedientes y Estratega Procesal Colombiano** experto ante cualquier despacho judicial, superintendencia, alcaldía u órgano de control en Colombia.
 
 {MARCO_JURIDICO_COLOMBIA}
@@ -913,7 +938,6 @@ Después de la tabla, desarrolla a fondo cada contradicción y su consecuencia j
 ## 11. CHECKLIST DE VERIFICACIÓN ANTES DE RADICAR
 (Lista de chequeo práctica de anexos, firmas, traslado previo y correos antes de radicar).
 """
-    return prompt
 
 def construir_prompt_consultor_desde_cero(
     problema_descrito,
@@ -933,7 +957,7 @@ def construir_prompt_consultor_desde_cero(
             partes_docs.append(f"--- DOCUMENTO ADJUNTO #{idx}: {it['nombre']} ---\n{it['raw'][:limite_chars_por_doc]}")
         contexto_expediente = "\n\n".join(partes_docs)
 
-    prompt = f"""
+    return f"""
 Actúa como un **Abogado Litigante Colombiano Senior y Consultor Estratégico Especialista en todas las jurisdicciones y entidades de Colombia**.
 Orienta al usuario con precisión quirúrgica sobre **qué hacer frente a su problema jurídico o actuación por iniciar**, conforme a las leyes colombianas vigentes.
 
@@ -976,7 +1000,6 @@ GENERA LA ESTRATEGIA Y EL ESCRITO LISTO PARA RADICAR CON ESTA ESTRUCTURA EN MARK
 (IMPORTANTE: Redacta aquí ÚNICAMENTE el documento jurídico formal completo y listo para firmar y radicar, con todos los requisitos de ley colombiana).
 ## 8. CHECKLIST DE PRUEBAS Y ANEXOS NECESARIOS
 """
-    return prompt
 
 def construir_prompt_abogado_diablo(borrador_usuario, tipo_proceso, entidad_especifica, datos_firmante):
     return f"""
@@ -1022,7 +1045,7 @@ with st.sidebar:
         "Google Gemini API Key",
         value=obtener_api_key_inicial(),
         type="password",
-        help="Pega tu clave de Google AI Studio. Si la configuras en 'Secrets' de Streamlit como GOOGLE_API_KEY, cargará sola siempre."
+        help="Pega tu clave de Google AI Studio. Si la guardas en 'Secrets' de Streamlit como GOOGLE_API_KEY, cargará sola siempre."
     )
 
     modelo_sel = st.selectbox(
@@ -1043,11 +1066,10 @@ with st.sidebar:
         "⚡ Motor OCR (Anti-Bloqueo CPU)",
         options=[
             "Nube Gemini Vision (0% CPU Local - Recomendado)",
-            "Tesseract Local Ligero (130 DPI)",
+            "Tesseract Local Ligero (120 DPI)",
             "Desactivado (Solo PDFs Digitales - Ultra Rápido)"
         ],
-        index=0,
-        help="¡Clave para evitar que Streamlit limite tu CPU! 'Nube Gemini Vision' delega la lectura de páginas escaneadas a los servidores de Google sin gastar procesador de Streamlit."
+        index=0
     )
 
     st.divider()
@@ -1085,7 +1107,6 @@ with st.sidebar:
     )
 
     with st.expander("👤 Mis Datos para Firmar Escritos (Opcional)"):
-        st.caption("Se insertan automáticamente en tus memoriales, tutelas, quejas o derechos de petición:")
         firmante_nombre = st.text_input("Nombre Completo", placeholder="Ej: Juan Pérez Gómez")
         firmante_doc = st.text_input("Cédula / NIT / T.P.", placeholder="Ej: C.C. 1.000.000.000")
         firmante_ciudad = st.text_input("Ciudad y Departamento", placeholder="Ej: Bogotá D.C.")
@@ -1110,35 +1131,50 @@ with st.sidebar:
 
     st.divider()
     if st.button("🗑️ Limpiar Sesión y Memoria RAM", use_container_width=True):
-        for k_limpiar in DEFAULTS_SESION:
-            st.session_state[k_limpiar] = [] if isinstance(DEFAULTS_SESION[k_limpiar], list) else (
-                {} if isinstance(DEFAULTS_SESION[k_limpiar], dict) else (
-                    pd.DataFrame() if isinstance(DEFAULTS_SESION[k_limpiar], pd.DataFrame) else ""
-                )
-            )
+        st.session_state.expediente_docs = []
+        st.session_state.cache_hashes = {}
+        st.session_state.actuaciones_df = pd.DataFrame()
+        st.session_state.catalogo_df = pd.DataFrame()
+        st.session_state.informe_md = ""
+        st.session_state.estrategia_md = ""
+        st.session_state.blindaje_md = ""
+        st.session_state.historial_chat = []
         gc.collect()
-        st.rerun()
 
 # =====================================================================
-# CABECERA EJECUTIVA E INDICADORES DE ESTADO EN TIEMPO REAL
+# CABECERA EJECUTIVA Y CONTENEDOR DE ESTADO
 # =====================================================================
-num_archivos_cargados = len(st.session_state.expediente_docs)
-num_folios_cargados = sum(d["num_paginas"] for d in st.session_state.expediente_docs)
-pill_ia = '<span class="status-pill status-pill-ok">🟢 Motor Gemini Conectado</span>' if api_key_input else '<span class="status-pill status-pill-warn">🟠 Ingresa tu API Key en el panel izquierdo</span>'
-
-st.markdown(f"""
-<div class="main-header">
+st.markdown("""
+<div class="main-header" translate="no">
     <h2 style="margin:0; font-weight:800;">⚖️ Bufete Litigante IA Colombia — Suite Forense & Estrategia Legal</h2>
     <p style="margin:0.35rem 0 0 0; opacity:0.92; font-size:0.98rem;">
         Auditoría cruzada de contradicciones en expedientes, redacción jurídica multijurisdiccional, simulador de contraparte y control de términos hábiles
     </p>
 </div>
-<div class="status-bar">
-    {pill_ia}
-    <span class="status-pill status-pill-ok">⚡ Protección Anti-Bloqueo CPU Activa (Caché SHA-256 + OCR Optimizado)</span>
-    <span class="status-pill">📁 Expediente en Memoria: {num_archivos_cargados} archivos ({num_folios_cargados} folios)</span>
-</div>
 """, unsafe_allow_html=True)
+
+banner_estado = st.empty()
+
+def actualizar_banner_estado():
+    n_arch = len(st.session_state.expediente_docs)
+    n_fol = sum(d["num_paginas"] for d in st.session_state.expediente_docs)
+    pill_ia = (
+        '<span class="status-pill status-pill-ok">🟢 Motor Gemini Conectado</span>'
+        if api_key_input
+        else '<span class="status-pill status-pill-warn">🟠 Ingresa tu API Key en el panel izquierdo</span>'
+    )
+    banner_estado.markdown(
+        f"""
+        <div class="status-bar" translate="no">
+            {pill_ia}
+            <span class="status-pill status-pill-ok">⚡ Escudo Anti-RAM / Anti-Traductor Activo</span>
+            <span class="status-pill">📁 Expediente en Memoria: {n_arch} archivos ({n_fol} folios)</span>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+actualizar_banner_estado()
 
 # ----------------- SEIS PESTAÑAS DE LITIGIO INTEGRAL -----------------
 tab_carga, tab_auditoria, tab_consultor, tab_blindaje, tab_rag, tab_export = st.tabs([
@@ -1151,11 +1187,11 @@ tab_carga, tab_auditoria, tab_consultor, tab_blindaje, tab_rag, tab_export = st.
 ])
 
 # =====================================================================
-# PESTAÑA 1: CARGA INCREMENTAL CON CACHÉ ANTI-CPU
+# PESTAÑA 1: CARGA ULTRA-ESTABLE (SIN st.rerun() PARA EVITAR removeChild)
 # =====================================================================
 with tab_carga:
     st.subheader("📤 Cargar Documentos del Expediente, Demanda, Oficios o Pruebas")
-    st.caption("Sistema con huella digital SHA-256: si agregas archivos nuevos más adelante, los documentos ya leídos se recuperan al instante sin volver a gastar CPU.")
+    st.caption("Optimizado para bajo consumo de RAM y CPU: puedes cargar decenas de PDFs sin desconectar el servidor.")
 
     archivos_subidos = st.file_uploader(
         "Arrastra aquí tus archivos (PDF, DOCX, TXT o RTF)",
@@ -1176,14 +1212,11 @@ with tab_carga:
 
             cliente_tmp = obtener_cliente_gemini(api_key_input) if api_key_input else None
             docs_procesados = []
-            barra = st.progress(0, text="Iniciando lectura inteligente con ahorro de CPU...")
+            zona_progreso = st.empty()
 
             for idx, arch in enumerate(archivos_subidos):
-                barra.progress(
-                    idx / len(archivos_subidos),
-                    text=f"Analizando {arch.name} ({idx + 1} de {len(archivos_subidos)})..."
-                )
-                item_doc = procesar_archivo_subido(
+                zona_progreso.info(f"⏳ Procesando documento {idx + 1} de {len(archivos_subidos)}: **{arch.name}**...")
+                item_doc = procesar_archivo_ligero(
                     arch,
                     api_key=api_key_input,
                     client=cliente_tmp,
@@ -1191,8 +1224,8 @@ with tab_carga:
                 )
                 docs_procesados.append(item_doc)
 
+            zona_progreso.empty()
             gc.collect()
-            barra.progress(1.0, text="¡Expediente indexado y memoria liberada!")
             st.session_state.expediente_docs = docs_procesados
 
             filas_cat = []
@@ -1200,7 +1233,7 @@ with tab_carga:
                 filas_cat.append({
                     "Archivo": it["nombre"],
                     "Páginas": it["num_paginas"],
-                    "Págs OCR": len(it["paginas_ocr"]),
+                    "Págs OCR": it["pags_ocr"],
                     "Caracteres": it["caracteres"],
                     "Radicado Detectado": it["meta"]["radicado"],
                     "Actuaciones": ", ".join(it["meta"]["tipo_actuacion"][:4]) or "General",
@@ -1210,16 +1243,16 @@ with tab_carga:
                     "Hash SHA-256": it["hash"]
                 })
             st.session_state.catalogo_df = pd.DataFrame(filas_cat)
-            st.session_state.actuaciones_df = extraer_linea_tiempo_regex(docs_procesados)
-            st.success(f"✅ {len(docs_procesados)} documentos indexados correctamente con protección de CPU activada.")
-            st.rerun()
+            st.session_state.actuaciones_df = consolidar_cronologia_df(docs_procesados)
+            actualizar_banner_estado()
+            st.success(f"✅ ¡Listo! {len(docs_procesados)} documentos indexados correctamente. Ahora pasa a la Pestaña 2 para ejecutar la auditoría.")
 
     if st.session_state.expediente_docs:
         docs_mem = st.session_state.expediente_docs
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("📁 Archivos en Bóveda", len(docs_mem))
         m2.metric("📄 Total Páginas / Folios", sum(d["num_paginas"] for d in docs_mem))
-        m3.metric("🔍 Folios Leídos con OCR", sum(len(d["paginas_ocr"]) for d in docs_mem))
+        m3.metric("🔍 Folios Leídos con OCR", sum(d["pags_ocr"] for d in docs_mem))
         m4.metric("📝 Caracteres Extraídos", f"{sum(d['caracteres'] for d in docs_mem):,}")
 
         st.markdown("#### 📋 Inventario Técnico del Expediente")
@@ -1245,7 +1278,7 @@ with tab_carga:
 # =====================================================================
 with tab_auditoria:
     st.subheader("🔍 Auditoría Forense de Contradicciones, Pruebas y Plan de Acción")
-    st.write("Cruza todos los folios de tus PDFs para descubrir mentiras, contradicciones fácticas o errores judiciales/administrativos, indicándote qué hacer y redactando el memorial.")
+    st.write("Cruza todos los folios de tus PDFs para descubrir contradicciones fácticas o errores judiciales/administrativos, indicándote qué hacer y redactando el memorial.")
 
     enfoque_usuario = st.text_area(
         "🎯 ¿Qué contradicciones, incumplimientos o puntos críticos quieres que tu Abogado IA revise con lupa? (Opcional):",
@@ -1259,21 +1292,20 @@ with tab_auditoria:
         elif not st.session_state.expediente_docs:
             st.warning("⚠️ Primero carga tus documentos en la Pestaña 1 (o usa la Pestaña 3 si aún no tienes documentos).")
         else:
-            client = obtener_cliente_gemini(api_key_input)
-            prompt_aud = construir_prompt_auditoria(
-                items=st.session_state.expediente_docs,
-                catalogo_df=st.session_state.catalogo_df,
-                actuaciones_df=st.session_state.actuaciones_df,
-                tipo_proceso=tipo_proceso,
-                entidad_especifica=entidad_especifica,
-                rol_usuario=rol_usuario,
-                enfoque_especial=enfoque_usuario,
-                datos_firmante=datos_firmante_dict,
-                limite_chars_por_doc=limite_chars
-            )
-
             with st.spinner("⚖️ Auditando folios en la nube de Gemini, cruzando pruebas y redactando informe + memorial..."):
                 try:
+                    client = obtener_cliente_gemini(api_key_input)
+                    prompt_aud = construir_prompt_auditoria(
+                        items=st.session_state.expediente_docs,
+                        catalogo_df=st.session_state.catalogo_df,
+                        actuaciones_df=st.session_state.actuaciones_df,
+                        tipo_proceso=tipo_proceso,
+                        entidad_especifica=entidad_especifica,
+                        rol_usuario=rol_usuario,
+                        enfoque_especial=enfoque_usuario,
+                        datos_firmante=datos_firmante_dict,
+                        limite_chars_por_doc=limite_chars
+                    )
                     texto_informe, modelo_usado = llamar_gemini(
                         client=client,
                         api_key=api_key_input,
@@ -1282,6 +1314,7 @@ with tab_auditoria:
                         temperatura=0.1
                     )
                     st.session_state.informe_md = texto_informe
+                    gc.collect()
                     st.success(f"✅ Auditoría completada con `{modelo_usado}`.")
                 except Exception as e:
                     st.error(f"❌ Error al generar la auditoría: {str(e)}")
@@ -1372,21 +1405,20 @@ with tab_consultor:
         elif not problema_descrito or len(problema_descrito.strip()) < 15:
             st.warning("⚠️ Describe tu caso o inconveniente con al menos un párrafo breve para darte una asesoría exacta.")
         else:
-            client = obtener_cliente_gemini(api_key_input)
-            prompt_est = construir_prompt_consultor_desde_cero(
-                problema_descrito=problema_descrito,
-                tipo_proceso=tipo_proceso,
-                entidad_especifica=entidad_especifica,
-                rol_usuario=rol_usuario,
-                documento_a_generar=documento_a_generar,
-                incluir_docs_cargados=incluir_docs_cargados,
-                items=st.session_state.expediente_docs,
-                datos_firmante=datos_firmante_dict,
-                limite_chars_por_doc=limite_chars
-            )
-
             with st.spinner("⚖️ Analizando legislación y jurisprudencia colombiana y redactando tu documento..."):
                 try:
+                    client = obtener_cliente_gemini(api_key_input)
+                    prompt_est = construir_prompt_consultor_desde_cero(
+                        problema_descrito=problema_descrito,
+                        tipo_proceso=tipo_proceso,
+                        entidad_especifica=entidad_especifica,
+                        rol_usuario=rol_usuario,
+                        documento_a_generar=documento_a_generar,
+                        incluir_docs_cargados=incluir_docs_cargados,
+                        items=st.session_state.expediente_docs,
+                        datos_firmante=datos_firmante_dict,
+                        limite_chars_por_doc=limite_chars
+                    )
                     texto_estrategia, modelo_usado = llamar_gemini(
                         client=client,
                         api_key=api_key_input,
@@ -1395,6 +1427,7 @@ with tab_consultor:
                         temperatura=0.15
                     )
                     st.session_state.estrategia_md = texto_estrategia
+                    gc.collect()
                     st.success(f"✅ Estrategia y escrito generados con `{modelo_usado}`.")
                 except Exception as e:
                     st.error(f"❌ Error al generar la estrategia: {str(e)}")
@@ -1473,15 +1506,15 @@ with tab_blindaje:
             elif not borrador_a_blindar or len(borrador_a_blindar.strip()) < 30:
                 st.warning("⚠️ Ingresa o selecciona un borrador válido para blindar.")
             else:
-                client = obtener_cliente_gemini(api_key_input)
-                prompt_diablo = construir_prompt_abogado_diablo(
-                    borrador_usuario=borrador_a_blindar,
-                    tipo_proceso=tipo_proceso,
-                    entidad_especifica=entidad_especifica,
-                    datos_firmante=datos_firmante_dict
-                )
                 with st.spinner("⚔️ Simulando ataques de la contraparte y blindando tu documento..."):
                     try:
+                        client = obtener_cliente_gemini(api_key_input)
+                        prompt_diablo = construir_prompt_abogado_diablo(
+                            borrador_usuario=borrador_a_blindar,
+                            tipo_proceso=tipo_proceso,
+                            entidad_especifica=entidad_especifica,
+                            datos_firmante=datos_firmante_dict
+                        )
                         res_blindaje, mod_b = llamar_gemini(
                             client=client,
                             api_key=api_key_input,
@@ -1490,6 +1523,7 @@ with tab_blindaje:
                             temperatura=0.1
                         )
                         st.session_state.blindaje_md = res_blindaje
+                        gc.collect()
                         st.success(f"✅ Escrito blindado con éxito (`{mod_b}`).")
                     except Exception as e:
                         st.error(f"❌ Error en el blindaje: {str(e)}")
@@ -1514,13 +1548,7 @@ with tab_blindaje:
             ]
         )
 
-        mapa_dias = {
-            "15 días": 15,
-            "10 días": 10,
-            "30 días": 30,
-            "3 días": 3,
-            "20 días": 20
-        }
+        mapa_dias = {"15 días": 15, "10 días": 10, "30 días": 30, "3 días": 3, "20 días": 20}
         dias_defecto = 15
         for clave_d, val_d in mapa_dias.items():
             if clave_d in termino_preset:
@@ -1616,15 +1644,16 @@ with tab_rag:
 
             with st.chat_message("assistant"):
                 with st.spinner("Consultando folios y normativa colombiana..."):
-                    client = obtener_cliente_gemini(api_key_input)
-                    if st.session_state.expediente_docs:
-                        contexto_docs = "\n\n".join(
-                            [f"=== DOCUMENTO: {d['nombre']} ===\n{d['raw'][:limite_chars]}" for d in st.session_state.expediente_docs]
-                        )
-                    else:
-                        contexto_docs = "Sin documentos subidos en esta sesión. Responde conforme a la legislación colombiana vigente."
+                    try:
+                        client = obtener_cliente_gemini(api_key_input)
+                        if st.session_state.expediente_docs:
+                            contexto_docs = "\n\n".join(
+                                [f"=== DOCUMENTO: {d['nombre']} ===\n{d['raw'][:limite_chars]}" for d in st.session_state.expediente_docs]
+                            )
+                        else:
+                            contexto_docs = "Sin documentos subidos en esta sesión. Responde conforme a la legislación colombiana vigente."
 
-                    prompt_pregunta = f"""
+                        prompt_pregunta = f"""
 Actúa como abogado litigante colombiano senior.
 {MARCO_JURIDICO_COLOMBIA}
 
@@ -1637,7 +1666,6 @@ CONTEXTO DOCUMENTAL:
 PREGUNTA DEL USUARIO:
 {pregunta_activa}
 """
-                    try:
                         respuesta_chat, _ = llamar_gemini(
                             client=client,
                             api_key=api_key_input,
@@ -1655,7 +1683,7 @@ PREGUNTA DEL USUARIO:
 # =====================================================================
 with tab_export:
     st.subheader("📄 Bóveda Central de Entregables Profesionales")
-    st.caption("Todos los archivos se compilan con caché inteligente (0% sobrecarga de CPU) y están listos para descargar.")
+    st.caption("Descarga tus dictámenes completos, escritos limpios listos para firmar y matrices de control en Excel.")
 
     col_e1, col_e2, col_e3, col_e4 = st.columns(4)
 
