@@ -772,12 +772,8 @@ def extraer_solo_borrador_radicable(md_texto: str) -> str:
 
 def convertir_markdown_a_docx_bytes(md_texto: str, titulo_portada="INFORME JURÍDICO Y PLAN DE ACCIÓN PROCESAL", incluir_portada=True) -> bytes:
     doc = Document()
-    def convertir_markdown_a_docx_bytes(md_texto: str, titulo_portada="INFORME JURÍDICO Y PLAN DE ACCIÓN PROCESAL", incluir_portada=True) -> bytes:
-    doc = Document()
     md_texto = re.sub(r'```(?:markdown)?\s*', '', md_texto, flags=re.I)
     md_texto = re.sub(r'<br\s*/?>', ' / ', md_texto, flags=re.I)
-
-    for section in doc.sections:
 
     for section in doc.sections:
         section.top_margin = Inches(0.85)
