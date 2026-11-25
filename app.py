@@ -562,7 +562,7 @@ def procesar_expediente_hibrido_preciso(archivos_subidos, api_key: str, client, 
                             bloques_paginas.append(f"[Archivo: {nombre} - Pág. {num_pag} (SIN TEXTO DIGITAL - ACTIVA MODO HÍBRIDO SI ES ESCANEADO)]")
                         else:
                             jpg_nitido = preparar_jpeg_escaneado_nitido(page)
-                            if jpg_nitido and len(cola_escaneadas) < 60:
+                            if jpg_nitido and len(cola_escaneadas) < 200:
                                 cola_escaneadas.append((idx_arch, p_i, nombre, num_pag, jpg_nitido))
                                 bloques_paginas.append("__PENDIENTE_OCR__")
                             else:
@@ -772,6 +772,12 @@ def extraer_solo_borrador_radicable(md_texto: str) -> str:
 
 def convertir_markdown_a_docx_bytes(md_texto: str, titulo_portada="INFORME JURÍDICO Y PLAN DE ACCIÓN PROCESAL", incluir_portada=True) -> bytes:
     doc = Document()
+    def convertir_markdown_a_docx_bytes(md_texto: str, titulo_portada="INFORME JURÍDICO Y PLAN DE ACCIÓN PROCESAL", incluir_portada=True) -> bytes:
+    doc = Document()
+    md_texto = re.sub(r'```(?:markdown)?\s*', '', md_texto, flags=re.I)
+    md_texto = re.sub(r'<br\s*/?>', ' / ', md_texto, flags=re.I)
+
+    for section in doc.sections:
 
     for section in doc.sections:
         section.top_margin = Inches(0.85)
