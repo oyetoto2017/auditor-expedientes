@@ -272,25 +272,24 @@ def obtener_cliente_gemini(api_key: str):
     return genai.Client(api_key=api_key.strip())
 
 def obtener_cola_modelos(client, api_key: str):
-    key_fp = hashlib.sha256(api_key.strip().encode("utf-8")).hexdigest()[:12]
+    key_fp = "v3_" + hashlib.sha256(api_key.strip().encode("utf-8")).hexdigest()[:12]
     if key_fp in st.session_state.modelos_cache:
         return list(st.session_state.modelos_cache[key_fp])
 
     modelos_cuenta = []
+    excluidos = (
+        "embedding", "image", "imagen", "veo", "tts", "aqa",
+        "audio", "live", "robotics", "computer-use", "learnlm",
+        "speech", "transcribe", "gemma"
+    )
     try:
         for m in client.models.list():
             nombre = getattr(m, "name", "")
             if not nombre:
                 continue
-            limpio = nombre.replace("models/", "")
+            limpio = nombre.replace("models/", "").strip()
             low = limpio.lower()
-            if "gemini" not in low:
-                continue
-            excluidos = [
-                "embedding", "imagen", "veo", "tts", "aqa",
-                "audio", "live", "robotics", "computer-use", "learnlm"
-            ]
-            if any(x in low for x in excluidos):
+            if "gemini" not in low or any(x in low for x in excluidos):
                 continue
             acciones = getattr(m, "supported_actions", None) or getattr(m, "supported_generation_methods", None)
             if acciones and not any("generatecontent" in str(a).lower() for a in acciones):
@@ -304,30 +303,31 @@ def obtener_cola_modelos(client, api_key: str):
         score = 0
         if "gemini-3" in n:
             score += 100
-        elif "latest" in n:
-            score += 80
         elif "gemini-2.5" in n:
             score += 50
         if "flash" in n and "lite" not in n:
             score += 25
         elif "lite" in n:
-            score += 18
+            score += 22
         elif "pro" in n:
             score += 15
         return -score
 
     ordenados = sorted(list(dict.fromkeys(modelos_cuenta)), key=puntaje_modelo)
-    cola = ordenados + [m for m in MODELOS_RESPALDO if m not in ordenados]
+    respaldo_limpio = [m for m in MODELOS_RESPALDO if "latest" not in m.lower() and not any(x in m.lower() for x in excluidos)]
+    cola = ordenados + [m for m in respaldo_limpio if m not in ordenados]
     st.session_state.modelos_cache[key_fp] = cola
     return list(cola)
 
-def llamar_gemini(client, api_key: str, prompt_contents, modelo_preferido="Auto-Detectar (Recomendado)", temperatura=0.1, max_modelos_probar=3):
+def llamar_gemini(client, api_key: str, prompt_contents, modelo_preferido="Auto-Detectar (Recomendado)", temperatura=0.1, max_modelos_probar=10):
     cola_modelos = obtener_cola_modelos(client, api_key)
-    if modelo_preferido and modelo_preferido != "Auto-Detectar (Recomendado)":
+    if modelo_preferido and modelo_preferido != "Auto-Detectar (Recomendado)" and "latest" not in modelo_preferido.lower():
         cola_modelos = [modelo_preferido] + [m for m in cola_modelos if m != modelo_preferido]
 
-    cola_corta = cola_modelos[:max_modelos_probar]
+    limite_intentos = max(max_modelos_probar, 6)
+    cola_corta = cola_modelos[:limite_intentos]
     errores = []
+    modelos_saturados_503 = []
 
     for modelo in cola_corta:
         try:
@@ -341,11 +341,35 @@ def llamar_gemini(client, api_key: str, prompt_contents, modelo_preferido="Auto-
         except Exception as e:
             msg = str(e).lower()
             errores.append(f"{modelo}: {str(e)[:120]}")
-            if "429" in msg or "quota" in msg or "resource_exhausted" in msg:
-                time.sleep(1.2)
-            continue
+            if "404" in msg or "not found" in msg:
+                continue
+            if any(cod in msg for cod in ("503", "unavailable", "overloaded", "high demand")):
+                modelos_saturados_503.append(modelo)
+                continue
+            if any(cod in msg for cod in ("429", "quota", "resource_exhausted")):
+                time.sleep(1.5)
+                continue
 
-    raise RuntimeError("No fue posible obtener respuesta de Gemini. Detalles: " + " | ".join(errores))
+    # Segundo intento automático solo sobre modelos válidos que estaban ocupados (503)
+    if modelos_saturados_503:
+        time.sleep(5.0)
+        for modelo in modelos_saturados_503[:3]:
+            try:
+                resp = client.models.generate_content(
+                    model=modelo,
+                    contents=prompt_contents,
+                    config=types.GenerateContentConfig(temperature=temperatura)
+                )
+                if resp and resp.text:
+                    return resp.text, modelo
+            except Exception as e:
+                errores.append(f"{modelo} (reintento): {str(e)[:120]}")
+                time.sleep(2.0)
+
+    raise RuntimeError(
+        "Los servidores de Gemini están con alta demanda temporal. "
+        "Espera 30 segundos y vuelve a intentar. Detalles: " + " | ".join(errores[-4:])
+    )
 
 # =====================================================================
 # MOTOR HÍBRIDO V4.4: LECTURA RÁPIDA (~15s) + MÁXIMA PRECISIÓN (sort=True + LOTES OCR)
